@@ -1,0 +1,44 @@
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Databases and logs
+*.db
+*.sqlite3
+*.log
+
+# Environment files
+*.env
+env/
+
+# IDE and editor folders
+.DS_Store
+.idea/
+.vscode/
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+*.egg
+
+# Test / cache
+.pytest_cache/
+.mypy_cache/
+.cache/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Misc
+*.swp
+*.swo
+Thumbs.db

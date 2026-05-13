@@ -4,7 +4,7 @@ A Streamlit web application for consolidating multiple Informatica usage spreads
 
 ## Features
 
-### 📊 Data Processing
+### Data Processing
 - **Multiple File Upload**: Support for drag-and-drop upload of multiple Excel files
 - **Automatic Normalization**: Handles column name variations across files
 - **Efficient Merging**: Optimized for datasets with 500,000+ rows
@@ -14,7 +14,7 @@ A Streamlit web application for consolidating multiple Informatica usage spreads
   - Cost/IPU/Month (calculated from IPUs)
   - Org (mapped from Org ID)
 
-### 📈 Analysis & Reporting
+### Analysis & Reporting
 - **Data Preview**: View processed data with pagination
 - **Duplicate Detection**: Identify duplicate Task Run IDs
 - **Status Analysis**: Count tasks by Status with visualizations
@@ -25,12 +25,12 @@ A Streamlit web application for consolidating multiple Informatica usage spreads
   - Task Type
 - **Column Statistics**: Descriptive statistics for all numeric columns
 
-### 💾 Export Options
+### Export Options
 - **Excel Export**: Download consolidated data as .xlsx file
 - **CSV Export**: Download data as .csv file
 - **Summary Report**: Multi-sheet Excel report with summaries
 
-### ⚙️ Configuration
+### Configuration
 - **IPU Conversion Factor**: Adjustable multiplier for IPU calculations
 - **Cost Per IPU/Month**: Configurable pricing model
 - **Org ID Mappings**: Add/edit custom organization name mappings
