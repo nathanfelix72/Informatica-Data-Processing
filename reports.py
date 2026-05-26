@@ -682,16 +682,16 @@ def detect_anomalies(metric: str = 'total_ipus', threshold_std: float = 2.0) -> 
 
 
 # ============================================================================
-# NEW TIME-SERIES ANALYSIS FUNCTIONS (by task start date, not run date)
+# NEW HISTORICAL ANALYSIS FUNCTIONS (by task end date, not run date)
 # ============================================================================
 
 def get_task_date_range() -> tuple:
-    """Get the min and max start dates from all tasks in the database."""
+    """Get the min and max end dates from all tasks in the database."""
     init_database()
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    cursor.execute('SELECT MIN(start_time), MAX(start_time) FROM tasks WHERE start_time IS NOT NULL')
+    cursor.execute('SELECT MIN(end_time), MAX(end_time) FROM tasks WHERE end_time IS NOT NULL')
     result = cursor.fetchone()
     conn.close()
     
@@ -723,7 +723,7 @@ def get_tasks_by_date_range(start_date: str, end_date: str,
     init_database()
     conn = sqlite3.connect(DB_PATH)
     
-    query = 'SELECT * FROM tasks WHERE start_time >= ? AND start_time <= ?'
+    query = 'SELECT * FROM tasks WHERE end_time >= ? AND end_time <= ?'
     params = [f'{start_date} 00:00:00', f'{end_date} 23:59:59']
     
     if org:
@@ -742,7 +742,7 @@ def get_tasks_by_date_range(start_date: str, end_date: str,
         query += ' AND status = ?'
         params.append(status)
     
-    query += ' ORDER BY start_time'
+    query += ' ORDER BY end_time'
     
     df = pd.read_sql_query(query, conn, params=params)
     conn.close()
@@ -765,12 +765,12 @@ def get_daily_stats_by_date_range(start_date: str, end_date: str,
     cost_per_ipu = float(calculations.COST_PER_IPU_MONTH)
 
     query = (
-        "SELECT DATE(start_time) AS date, "
+        "SELECT DATE(end_time) AS date, "
         "COUNT(*) AS task_count, "
         "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
         "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost "
         "FROM tasks "
-        "WHERE start_time >= ? AND start_time <= ?"
+        "WHERE end_time >= ? AND end_time <= ?"
     )
     params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
 
@@ -784,7 +784,7 @@ def get_daily_stats_by_date_range(start_date: str, end_date: str,
         query += ' AND environment = ?'
         params.append(environment)
 
-    query += ' GROUP BY DATE(start_time) ORDER BY DATE(start_time)'
+    query += ' GROUP BY DATE(end_time) ORDER BY DATE(end_time)'
 
     daily = pd.read_sql_query(query, conn, params=params)
     conn.close()
@@ -804,7 +804,7 @@ def get_org_stats_by_date_range(start_date: str, end_date: str) -> pd.DataFrame:
         "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
         "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
         "COUNT(DISTINCT task_id) AS unique_tasks "
-        "FROM tasks WHERE start_time >= ? AND start_time <= ? "
+        "FROM tasks WHERE end_time >= ? AND end_time <= ? "
         "GROUP BY org ORDER BY total_ipus DESC"
     )
     params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
@@ -826,7 +826,7 @@ def get_project_stats_by_date_range(start_date: str, end_date: str) -> pd.DataFr
         "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
         "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
         "COUNT(DISTINCT task_id) AS unique_tasks "
-        "FROM tasks WHERE start_time >= ? AND start_time <= ? "
+        "FROM tasks WHERE end_time >= ? AND end_time <= ? "
         "GROUP BY project_name ORDER BY total_ipus DESC"
     )
     params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
@@ -848,7 +848,7 @@ def get_environment_stats_by_date_range(start_date: str, end_date: str) -> pd.Da
         "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
         "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
         "COUNT(DISTINCT task_id) AS unique_tasks "
-        "FROM tasks WHERE start_time >= ? AND start_time <= ? "
+        "FROM tasks WHERE end_time >= ? AND end_time <= ? "
         "GROUP BY environment ORDER BY total_ipus DESC"
     )
     params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
@@ -870,7 +870,7 @@ def get_task_type_stats_by_date_range(start_date: str, end_date: str) -> pd.Data
         "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
         "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
         "COUNT(DISTINCT task_id) AS unique_tasks "
-        "FROM tasks WHERE start_time >= ? AND start_time <= ? "
+        "FROM tasks WHERE end_time >= ? AND end_time <= ? "
         "GROUP BY task_type ORDER BY total_ipus DESC"
     )
     params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
@@ -891,7 +891,7 @@ def get_status_stats_by_date_range(start_date: str, end_date: str) -> pd.DataFra
         "SELECT status, COUNT(*) AS task_count, "
         "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
         "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost "
-        "FROM tasks WHERE start_time >= ? AND start_time <= ? "
+        "FROM tasks WHERE end_time >= ? AND end_time <= ? "
         "GROUP BY status ORDER BY total_ipus DESC"
     )
     params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
@@ -965,15 +965,15 @@ def get_task_spikes_for_period(
     cost_per_ipu = float(calculations.COST_PER_IPU_MONTH)
 
     query = (
-        "SELECT DATE(start_time) AS task_date, "
+        "SELECT DATE(end_time) AS task_date, "
         "task_name, task_id, org, project_name, "
         "COUNT(*) AS run_count, "
         "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS daily_ipus, "
         "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS daily_cost "
         "FROM tasks "
-        "WHERE start_time >= ? AND start_time <= ? "
+        "WHERE end_time >= ? AND end_time <= ? "
         "AND task_name IS NOT NULL AND TRIM(task_name) <> '' "
-        "GROUP BY DATE(start_time), task_name, task_id, org, project_name"
+        "GROUP BY DATE(end_time), task_name, task_id, org, project_name"
     )
     params = [
         ipu_factor,
