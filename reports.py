@@ -164,6 +164,20 @@ def init_database():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+
+    # Audit trail for history edits and imports
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS history_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL,
+            start_date DATE,
+            end_date DATE,
+            affected_rows INTEGER,
+            remaining_rows INTEGER,
+            note TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
     
     # Create indices for efficient queries
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_start_time ON tasks(start_time)')
@@ -172,6 +186,8 @@ def init_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_environment ON tasks(environment)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_task_type ON tasks(task_type)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_status ON tasks(status)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_events_created_at ON history_events(created_at)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_events_action ON history_events(action)')
 
     # If an existing DB was created before row_hash existed, try to add the column
     cursor.execute("PRAGMA table_info(tasks)")
@@ -188,6 +204,50 @@ def init_database():
     
     conn.commit()
     conn.close()
+
+
+def record_history_event(action: str, start_date=None, end_date=None, affected_rows: int | None = None,
+                         remaining_rows: int | None = None, note: str | None = None) -> None:
+    """Persist an audit event for an import or deletion."""
+    init_database()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        '''
+        INSERT INTO history_events (action, start_date, end_date, affected_rows, remaining_rows, note)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ''',
+        (
+            action,
+            None if start_date is None else str(start_date),
+            None if end_date is None else str(end_date),
+            affected_rows,
+            remaining_rows,
+            note,
+        )
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_history_events(action: str = None, limit: int | None = None) -> pd.DataFrame:
+    """Return the audit trail for historical imports and deletes."""
+    init_database()
+    conn = sqlite3.connect(DB_PATH)
+
+    query = 'SELECT * FROM history_events'
+    params = []
+    if action:
+        query += ' WHERE action = ?'
+        params.append(action)
+    query += ' ORDER BY created_at DESC, event_id DESC'
+    if limit is not None:
+        query += ' LIMIT ?'
+        params.append(int(limit))
+
+    df = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return df
 
 
 def get_mst_timestamp():
@@ -412,9 +472,87 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int]:
     progress_callback(100, f'Finished. {rows_added} new rows added, {after_count} total rows')
     logger.info(f'Finished save_run: {rows_added} new rows, {after_count} total')
 
+    if rows_added > 0:
+        date_source = None
+        for candidate in ['End Time', 'Start Time']:
+            if candidate in merged_df.columns:
+                parsed_dates = pd.to_datetime(merged_df[candidate], errors='coerce')
+                parsed_dates = parsed_dates.dropna()
+                if not parsed_dates.empty:
+                    date_source = parsed_dates
+                    break
+
+        if date_source is not None and not date_source.empty:
+            start_date = date_source.min().date().isoformat()
+            end_date = date_source.max().date().isoformat()
+        else:
+            start_date = None
+            end_date = None
+
+        record_history_event(
+            'ADD',
+            start_date=start_date,
+            end_date=end_date,
+            affected_rows=rows_added,
+            remaining_rows=after_count,
+            note='Historical rows appended from upload',
+        )
+
     conn.close()
 
     return rows_added, after_count
+
+
+def delete_tasks_by_date_range(start_date: str, end_date: str, org: str = None,
+                               project: str = None, environment: str = None,
+                               task_type: str = None, status: str = None) -> tuple[int, int]:
+    """Delete historical task rows in a date range and return deleted and remaining counts."""
+    init_database()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    query = 'DELETE FROM tasks WHERE end_time >= ? AND end_time <= ?'
+    params = [f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+
+    if org:
+        query += ' AND org = ?'
+        params.append(org)
+    if project:
+        query += ' AND project_name = ?'
+        params.append(project)
+    if environment:
+        query += ' AND environment = ?'
+        params.append(environment)
+    if task_type:
+        query += ' AND task_type = ?'
+        params.append(task_type)
+    if status:
+        query += ' AND status = ?'
+        params.append(status)
+
+    cursor.execute('SELECT COUNT(*) FROM tasks')
+    before_count = cursor.fetchone()[0]
+
+    cursor.execute(query, params)
+    deleted_rows = cursor.rowcount if cursor.rowcount != -1 else None
+
+    cursor.execute('SELECT COUNT(*) FROM tasks')
+    remaining_rows = cursor.fetchone()[0]
+    if deleted_rows is None:
+        deleted_rows = before_count - remaining_rows
+    conn.commit()
+    conn.close()
+
+    record_history_event(
+        'DELETE',
+        start_date=start_date,
+        end_date=end_date,
+        affected_rows=deleted_rows,
+        remaining_rows=remaining_rows,
+        note='Historical rows deleted by date range',
+    )
+
+    return deleted_rows, remaining_rows
 
 
 
@@ -946,6 +1084,7 @@ def get_task_spikes_for_period(
     threshold_std: float = 3.0,
     min_baseline_days: int = 5,
     top_n: int = 10,
+    org: str = None,
 ) -> pd.DataFrame:
     """Find task-level daily IPU spikes in the current window vs prior baseline.
 
@@ -973,8 +1112,11 @@ def get_task_spikes_for_period(
         "FROM tasks "
         "WHERE end_time >= ? AND end_time <= ? "
         "AND task_name IS NOT NULL AND TRIM(task_name) <> '' "
-        "GROUP BY DATE(end_time), task_name, task_id, org, project_name"
     )
+    if org:
+        query += " AND org = ?"
+
+    query += " GROUP BY DATE(end_time), task_name, task_id, org, project_name"
     params = [
         ipu_factor,
         ipu_factor,
@@ -982,6 +1124,8 @@ def get_task_spikes_for_period(
         f'{baseline_start.isoformat()} 00:00:00',
         f'{end_dt.isoformat()} 23:59:59',
     ]
+    if org:
+        params.append(org)
 
     all_daily = pd.read_sql_query(query, conn, params=params)
     conn.close()

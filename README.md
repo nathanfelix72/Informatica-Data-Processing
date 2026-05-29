@@ -24,6 +24,7 @@ A Streamlit web application for consolidating multiple Informatica usage spreads
   - Project Name
   - Task Type
 - **Column Statistics**: Descriptive statistics for all numeric columns
+- **History Management**: Review saved import batches and delete historical rows by date range
 
 ### Export Options
 - **Excel Export**: Download consolidated data as .xlsx file
