@@ -181,6 +181,7 @@ def init_database():
     
     # Create indices for efficient queries
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_start_time ON tasks(start_time)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_end_time ON tasks(end_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_org ON tasks(org)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_project ON tasks(project_name)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_environment ON tasks(environment)')
@@ -235,7 +236,7 @@ def get_history_events(action: str = None, limit: int | None = None) -> pd.DataF
     init_database()
     conn = sqlite3.connect(DB_PATH)
 
-    query = 'SELECT * FROM history_events'
+    query = 'SELECT event_id, action, start_date, end_date, affected_rows, remaining_rows, note, created_at FROM history_events'
     params = []
     if action:
         query += ' WHERE action = ?'
@@ -250,6 +251,40 @@ def get_history_events(action: str = None, limit: int | None = None) -> pd.DataF
     return df
 
 
+def count_tasks_by_date_range(start_date: str, end_date: str,
+                              org: str = None, project: str = None,
+                              environment: str = None, task_type: str = None,
+                              status: str = None) -> int:
+    """Count task records filtered by date range and optional dimensions."""
+    init_database()
+    conn = sqlite3.connect(DB_PATH)
+
+    query = 'SELECT COUNT(*) FROM tasks WHERE end_time >= ? AND end_time <= ?'
+    params = [f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+
+    if org:
+        query += ' AND org = ?'
+        params.append(org)
+    if project:
+        query += ' AND project_name = ?'
+        params.append(project)
+    if environment:
+        query += ' AND environment = ?'
+        params.append(environment)
+    if task_type:
+        query += ' AND task_type = ?'
+        params.append(task_type)
+    if status:
+        query += ' AND status = ?'
+        params.append(status)
+
+    cursor = conn.cursor()
+    cursor.execute(query, params)
+    count = int(cursor.fetchone()[0])
+    conn.close()
+    return count
+
+
 def get_mst_timestamp():
     """Get current timestamp in Mountain Standard Time."""
     if _HAS_PYTZ:
@@ -262,7 +297,48 @@ def get_mst_timestamp():
         return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
 
-def save_run(merged_df: pd.DataFrame) -> tuple[int, int]:
+def _summarize_date_ranges(frame: pd.DataFrame) -> tuple[str | None, str | None, str | None]:
+    """Return overall start/end dates and a grouped date-range label for a frame."""
+    if frame is None or frame.empty:
+        return None, None, None
+
+    date_series = None
+    for candidate in ['End Time', 'Start Time']:
+        if candidate in frame.columns:
+            parsed = pd.to_datetime(frame[candidate], errors='coerce').dropna()
+            if not parsed.empty:
+                date_series = parsed.dt.date
+                break
+
+    if date_series is None or date_series.empty:
+        return None, None, None
+
+    unique_dates = sorted(set(date_series.tolist()))
+    start_date = unique_dates[0].isoformat()
+    end_date = unique_dates[-1].isoformat()
+
+    ranges = []
+    range_start = unique_dates[0]
+    range_end = unique_dates[0]
+    for current_date in unique_dates[1:]:
+        if current_date == range_end + timedelta(days=1):
+            range_end = current_date
+        else:
+            ranges.append((range_start, range_end))
+            range_start = current_date
+            range_end = current_date
+    ranges.append((range_start, range_end))
+
+    def _format_range(start, end):
+        if start == end:
+            return start.isoformat()
+        return f'{start.isoformat()} to {end.isoformat()}'
+
+    label = '; '.join(_format_range(start, end) for start, end in ranges)
+    return start_date, end_date, label
+
+
+def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None, str | None]:
     """Append merged rows to the historical task table, deduplicated by row hash.
 
     This implementation performs chunked batched inserts using `INSERT OR IGNORE`
@@ -302,7 +378,9 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int]:
         cursor.execute('SELECT COUNT(*) FROM tasks')
         total_rows = cursor.fetchone()[0]
         conn.close()
-        return 0, total_rows
+        return 0, total_rows, None, None, None
+
+    processed_start_date, processed_end_date, processed_label = _summarize_date_ranges(merged_df)
 
     # Only stable task identity belongs in the dedupe hash.
     # Derived/calculated fields (Run Date, IPUs, Cost/IPU/Month, etc.) and
@@ -319,7 +397,7 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int]:
         cursor.execute('SELECT COUNT(*) FROM tasks')
         total_rows = cursor.fetchone()[0]
         conn.close()
-        return 0, total_rows
+        return 0, total_rows, None, None, None
 
     def _compute_row_hash(row, cols):
         parts = []
@@ -350,26 +428,18 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int]:
             norm_df[num_col] = norm_df[num_col].round(6)
             norm_df[num_col] = norm_df[num_col].fillna(0)
 
-    # Compute row hash (vectorized if possible, otherwise chunked)
+    # Compute row hash using one deterministic algorithm for every row.
     total_rows = len(norm_df)
-    try:
-        from pandas.util import hash_pandas_object
-        progress_callback(5, 'Computing vectorized row hashes...')
-        hash_series = hash_pandas_object(norm_df[available_columns], index=False).astype('uint64')
-        norm_df['row_hash'] = hash_series.astype(str)
-        progress_callback(10, 'Row hashes computed (vectorized)')
-    except Exception:
-        # Fall back to chunked row-wise hashing with progress updates
-        logger.info('Vectorized hashing unavailable, falling back to chunked hashing')
-        chunk_hash = 5000
-        norm_df['row_hash'] = ''
-        for start in range(0, total_rows, chunk_hash):
-            end = min(start + chunk_hash, total_rows)
-            subset = norm_df.iloc[start:end]
-            hashes = subset.apply(lambda r: _compute_row_hash(r, available_columns), axis=1)
-            norm_df.loc[subset.index, 'row_hash'] = hashes.values
-            pct = int(10 + (end / total_rows) * 20)
-            progress_callback(pct, f'Computed hashes for rows {start}:{end}')
+    progress_callback(5, 'Computing deterministic row hashes...')
+    chunk_hash = 5000
+    norm_df['row_hash'] = ''
+    for start in range(0, total_rows, chunk_hash):
+        end = min(start + chunk_hash, total_rows)
+        subset = norm_df.iloc[start:end]
+        hashes = subset.apply(lambda r: _compute_row_hash(r, available_columns), axis=1)
+        norm_df.loc[subset.index, 'row_hash'] = hashes.values
+        pct = int(10 + (end / total_rows) * 20)
+        progress_callback(pct, f'Computed hashes for rows {start}:{end}')
 
     # Prepare DataFrame for DB insert
     col_map = {
@@ -414,6 +484,16 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int]:
             staging_df[num_col] = staging_df[num_col].round(6)
 
     staging_df['row_hash'] = norm_df['row_hash'].values
+
+    existing_hashes = set()
+    cursor.execute('SELECT row_hash FROM tasks WHERE row_hash IS NOT NULL')
+    for existing_row in cursor.fetchall():
+        if existing_row[0]:
+            existing_hashes.add(existing_row[0])
+
+    new_rows_df = staging_df[~staging_df['row_hash'].isin(existing_hashes)].drop_duplicates(subset=['row_hash'])
+    added_start_date, added_end_date, added_label = _summarize_date_ranges(new_rows_df)
+
     staging_df = staging_df.rename(columns=col_map)
 
     # Determine insert columns that actually exist
@@ -444,7 +524,7 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int]:
         cursor.execute('SELECT COUNT(*) FROM tasks')
         after_count = cursor.fetchone()[0]
         conn.close()
-        return 0, after_count
+        return 0, after_count, None, None
 
     chunk_size = 5000
     processed = 0
@@ -469,38 +549,33 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int]:
     after_count = cursor.fetchone()[0]
     rows_added = after_count - before_count
 
-    progress_callback(100, f'Finished. {rows_added} new rows added, {after_count} total rows')
-    logger.info(f'Finished save_run: {rows_added} new rows, {after_count} total')
-
     if rows_added > 0:
-        date_source = None
-        for candidate in ['End Time', 'Start Time']:
-            if candidate in merged_df.columns:
-                parsed_dates = pd.to_datetime(merged_df[candidate], errors='coerce')
-                parsed_dates = parsed_dates.dropna()
-                if not parsed_dates.empty:
-                    date_source = parsed_dates
-                    break
-
-        if date_source is not None and not date_source.empty:
-            start_date = date_source.min().date().isoformat()
-            end_date = date_source.max().date().isoformat()
+        if processed_label:
+            progress_callback(100, f'Finished. {rows_added} new rows added from processed {processed_label}, {after_count} total rows')
         else:
-            start_date = None
-            end_date = None
+            progress_callback(100, f'Finished. {rows_added} new rows added, {after_count} total rows')
+        logger.info(f'Finished save_run: {rows_added} new rows, {after_count} total')
+
+        if added_label:
+            note = f'Added date range(s): {added_label}'
 
         record_history_event(
             'ADD',
-            start_date=start_date,
-            end_date=end_date,
+            start_date=processed_start_date,
+            end_date=processed_end_date,
             affected_rows=rows_added,
             remaining_rows=after_count,
-            note='Historical rows appended from upload',
+            note=note,
         )
+    else:
+        processed_start_date = None
+        processed_end_date = None
+        progress_callback(100, f'Finished. {rows_added} new rows added, {after_count} total rows')
+        logger.info(f'Finished save_run: {rows_added} new rows, {after_count} total')
 
     conn.close()
 
-    return rows_added, after_count
+    return rows_added, after_count, processed_start_date, processed_end_date, added_label
 
 
 def delete_tasks_by_date_range(start_date: str, end_date: str, org: str = None,

@@ -35,6 +35,7 @@ from reports import (
     save_run,
     delete_tasks_by_date_range,
     get_history_events,
+    count_tasks_by_date_range,
     get_tasks_by_date_range,
     get_task_date_range,
     get_daily_stats_by_date_range,
@@ -988,12 +989,25 @@ def display_save_run_section(df):
                 pass
 
 
-            rows_added, total_rows = save_run(full_df)
+            rows_added, total_rows, processed_start_date, processed_end_date, added_ranges = save_run(full_df)
 
-            progress_cb(100, 'Historical save complete.')
+            if processed_start_date and processed_end_date:
+                if processed_start_date == processed_end_date:
+                    progress_cb(100, f'Historical save complete. {rows_added:,} rows processed from {processed_start_date}.')
+                else:
+                    progress_cb(100, f'Historical save complete. {rows_added:,} rows processed from {processed_start_date} to {processed_end_date}.')
+            else:
+                progress_cb(100, f'Historical save complete. {rows_added:,} rows added.')
 
             st.success("Data saved to the historical table")
             st.info(f"Rows added: {rows_added:,}")
+            if processed_start_date and processed_end_date:
+                if processed_start_date == processed_end_date:
+                    st.info(f"Processed dates: {processed_start_date}")
+                else:
+                    st.info(f"Processed dates: {processed_start_date} to {processed_end_date}")
+            if added_ranges:
+                st.info(f"Added date range(s): {added_ranges}")
             st.info(f"Total historical rows: {total_rows:,}")
 
         except Exception as e:
@@ -2541,15 +2555,40 @@ def display_historical_analysis():
                 for column in ['start_date', 'end_date', 'created_at']:
                     if column in display_additions.columns:
                         display_additions[column] = pd.to_datetime(display_additions[column], errors='coerce').dt.strftime('%Y-%m-%d %H:%M:%S')
+                processed_mask = (
+                    display_additions['start_date'].notna()
+                    & display_additions['end_date'].notna()
+                    & (display_additions['start_date'] != display_additions['end_date'])
+                ) if {'start_date', 'end_date'}.issubset(display_additions.columns) else None
+                if processed_mask is not None:
+                    display_additions['processed_date_range'] = display_additions['start_date']
+                    display_additions.loc[processed_mask, 'processed_date_range'] = (
+                        display_additions.loc[processed_mask, 'start_date'] + ' to ' + display_additions.loc[processed_mask, 'end_date']
+                    )
+                else:
+                    display_additions['processed_date_range'] = ''
+
+                note_series = display_additions['note'].fillna('').astype(str)
+                added_date_ranges = pd.Series('', index=display_additions.index, dtype='object')
+
+                new_prefix = 'Added date range(s): '
+                new_mask = note_series.str.contains(new_prefix, regex=False)
+                added_date_ranges.loc[new_mask] = note_series.loc[new_mask].str.split(new_prefix, n=1).str[-1]
+
+                legacy_prefix = '; added date range(s): '
+                legacy_mask = note_series.str.contains(legacy_prefix, regex=False)
+                added_date_ranges.loc[~new_mask & legacy_mask] = note_series.loc[~new_mask & legacy_mask].str.split(legacy_prefix, n=1).str[-1]
+
+                display_additions['added_date_ranges'] = added_date_ranges
                 st.dataframe(
-                    display_additions[['created_at', 'start_date', 'end_date', 'affected_rows', 'remaining_rows', 'note']],
+                    display_additions[['created_at', 'processed_date_range', 'added_date_ranges', 'affected_rows', 'remaining_rows', 'note']],
                     width='stretch',
                     hide_index=True,
                 )
 
             st.divider()
             st.subheader("Delete Date Range")
-            st.caption("Delete historical task rows by task end date. The preview below shows what will be removed.")
+            st.caption("Delete historical task rows by task end date. Load a preview only when you need it.")
             delete_start = st.date_input(
                 "Delete start date",
                 value=default_start_date,
@@ -2568,16 +2607,35 @@ def display_historical_analysis():
             if delete_start > delete_end:
                 st.error("Delete start date must be before end date")
             else:
-                rows_to_delete = get_tasks_by_date_range(delete_start.isoformat(), delete_end.isoformat())
-                st.info(f"{len(rows_to_delete):,} row(s) match this date range.")
+                delete_start_iso = delete_start.isoformat()
+                delete_end_iso = delete_end.isoformat()
+                preview_cache_key = f"history_delete_preview_{delete_start_iso}_{delete_end_iso}"
 
-                if not rows_to_delete.empty:
-                    preview_columns = [col for col in ['end_time', 'org', 'project_name', 'task_name', 'task_run_id', 'status'] if col in rows_to_delete.columns]
-                    st.dataframe(
-                        rows_to_delete[preview_columns].head(500),
-                        width='stretch',
-                        hide_index=True,
-                    )
+                rows_match = count_tasks_by_date_range(delete_start_iso, delete_end_iso)
+                st.info(f"{rows_match:,} row(s) match this date range.")
+
+                preview_requested = st.button(
+                    "Load Preview",
+                    width="stretch",
+                    key="history_delete_preview_button",
+                )
+                if preview_requested:
+                    st.session_state[preview_cache_key] = get_tasks_by_date_range(delete_start_iso, delete_end_iso)
+
+                rows_to_delete = st.session_state.get(preview_cache_key)
+
+                if rows_to_delete is not None:
+                    if rows_to_delete.empty:
+                        st.info("No rows match the selected date range.")
+                    else:
+                        preview_columns = [col for col in ['end_time', 'org', 'project_name', 'task_name', 'task_run_id', 'status'] if col in rows_to_delete.columns]
+                        st.dataframe(
+                            rows_to_delete[preview_columns].head(500),
+                            width='stretch',
+                            hide_index=True,
+                        )
+                else:
+                    st.caption("Click Load Preview to inspect matching rows before deleting.")
 
                 confirm_text = st.text_input(
                     "Type DELETE to confirm",
@@ -2592,14 +2650,17 @@ def display_historical_analysis():
                 if st.button("Delete Selected Date Range", width="stretch", type="primary"):
                     if confirm_text != "DELETE" or not confirm_action:
                         st.error("Type DELETE and check the confirmation box before deleting.")
-                    elif rows_to_delete.empty:
-                        st.info("No rows match the selected date range.")
                     else:
-                        deleted_rows, remaining_rows = delete_tasks_by_date_range(
-                            delete_start.isoformat(),
-                            delete_end.isoformat(),
-                        )
-                        st.success(f"Deleted {deleted_rows:,} row(s). {remaining_rows:,} row(s) remain in history.")
+                        if rows_to_delete is None:
+                            rows_to_delete = get_tasks_by_date_range(delete_start_iso, delete_end_iso)
+                        if rows_to_delete.empty:
+                            st.info("No rows match the selected date range.")
+                        else:
+                            deleted_rows, remaining_rows = delete_tasks_by_date_range(
+                                delete_start_iso,
+                                delete_end_iso,
+                            )
+                            st.success(f"Deleted {deleted_rows:,} row(s). {remaining_rows:,} row(s) remain in history.")
 
     except Exception as e:
         st.error(f"Error in historical analysis: {str(e)}")
