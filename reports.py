@@ -914,6 +914,52 @@ def get_task_date_range() -> tuple:
     return (result[0], result[1])
 
 
+def get_missing_task_date_ranges(start_date, end_date, org: str = None, project: str = None,
+                                 environment: str = None, task_type: str = None,
+                                 status: str = None) -> list[tuple]:
+    """Return consecutive date ranges with no task data inside the requested span."""
+    start_dt = pd.to_datetime(start_date).date()
+    end_dt = pd.to_datetime(end_date).date()
+
+    if start_dt > end_dt:
+        return []
+
+    daily_stats = get_daily_stats_by_date_range(
+        start_dt.isoformat(),
+        end_dt.isoformat(),
+        org=org,
+        project=project,
+        environment=environment,
+    )
+
+    expected_dates = pd.date_range(start=start_dt, end=end_dt, freq='D').date
+
+    if daily_stats.empty:
+        return [(start_dt, end_dt)]
+
+    observed_dates = {pd.to_datetime(value).date() for value in daily_stats['date'].dropna()}
+    missing_dates = sorted(set(expected_dates) - observed_dates)
+
+    if not missing_dates:
+        return []
+
+    missing_ranges = []
+    range_start = missing_dates[0]
+    previous_date = missing_dates[0]
+
+    for current_date in missing_dates[1:]:
+        if current_date == previous_date + timedelta(days=1):
+            previous_date = current_date
+            continue
+
+        missing_ranges.append((range_start, previous_date))
+        range_start = current_date
+        previous_date = current_date
+
+    missing_ranges.append((range_start, previous_date))
+    return missing_ranges
+
+
 def get_tasks_by_date_range(start_date: str, end_date: str, 
                             org: str = None, project: str = None,
                             environment: str = None, task_type: str = None,

@@ -77,6 +77,8 @@ def normalize_column_names(df):
         'folder name': 'Folder Name',
         'orgid': 'Org ID',
         'org id': 'Org ID',
+        'environment': 'Environment',
+        'environement': 'Environment',
         'environmentid': 'Environment ID',
         'environment id': 'Environment ID',
         'coresused': 'Cores Used',

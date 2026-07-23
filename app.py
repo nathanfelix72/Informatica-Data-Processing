@@ -38,6 +38,7 @@ from reports import (
     count_tasks_by_date_range,
     get_tasks_by_date_range,
     get_task_date_range,
+    get_missing_task_date_ranges,
     get_daily_stats_by_date_range,
     get_org_stats_by_date_range,
     get_project_stats_by_date_range,
@@ -1033,6 +1034,23 @@ def display_historical_analysis():
         
         st.write(f"Data available from **{min_date}** to **{max_date}**")
 
+        missing_ranges = get_missing_task_date_ranges(min_date, max_date)
+        if missing_ranges:
+            range_labels = []
+            for range_start, range_end in missing_ranges[:5]:
+                if range_start == range_end:
+                    range_labels.append(str(range_start))
+                else:
+                    range_labels.append(f"{range_start} to {range_end}")
+
+            extra_count = len(missing_ranges) - len(range_labels)
+            suffix = f" and {extra_count} more gap(s)" if extra_count > 0 else ""
+            st.warning(
+                f"Missing data detected on {len(missing_ranges)} gap(s): {', '.join(range_labels)}{suffix}."
+            )
+        else:
+            st.success("No missing days detected across the full available date span.")
+
         default_start_date = max(min_date, (max_date - timedelta(days=30)))
         default_end_date = max_date
 
@@ -1510,6 +1528,13 @@ def display_historical_analysis():
                         key="narrative_show_30_days",
                     )
 
+                show_environment = st.checkbox(
+                    "Show environments",
+                    value=False,
+                    key="narrative_show_environment",
+                    help="Include environment-level comparisons in the narrative summary.",
+                )
+
                 selected_periods = [
                     period_name for period_name, enabled in [
                         ("past week", show_week),
@@ -1592,10 +1617,67 @@ def display_historical_analysis():
                     direction = "↑" if value >= 0 else "↓"
                     return f"{direction} {abs(value):,.{precision}f}"
 
+                def _normalize_dimension_value(value):
+                    if pd.isna(value):
+                        return "(Unknown)"
+                    text = str(value).strip()
+                    return text if text else "(Unknown)"
+
+                def _build_dimension_summary_lines(dimension_label, dimension_key, stats_fn):
+                    period_defs = []
+                    if show_week:
+                        period_defs.append(("Past week", week_cur_start, week_cur_end, week_prev_start, week_prev_end))
+                    if show_month:
+                        period_defs.append(("Past calendar month", cur_start, cur_end, prev_start, prev_end))
+                    if show_30_days:
+                        period_defs.append(("Past 30 days", d30_cur_start, d30_cur_end, d30_prev_start, d30_prev_end))
+
+                    period_frames = {}
+                    for _, cur_s, cur_e, prev_s, prev_e in period_defs:
+                        period_frames[("cur", cur_s, cur_e)] = stats_fn(cur_s.isoformat(), cur_e.isoformat())
+                        period_frames[("prev", prev_s, prev_e)] = stats_fn(prev_s.isoformat(), prev_e.isoformat())
+
+                    dimension_values = sorted({
+                        _normalize_dimension_value(value)
+                        for frame in period_frames.values()
+                        if frame is not None and not frame.empty and dimension_key in frame.columns
+                        for value in frame[dimension_key].dropna().tolist()
+                    })
+
+                    lines = []
+                    if not dimension_values:
+                        lines.append(f"No {dimension_label.lower()}-level data available.")
+                        lines.append("")
+                        return lines, []
+
+                    for dimension_name in dimension_values:
+                        lines.append(f"{dimension_label}: {dimension_name}")
+                        for period_name, cur_s, cur_e, prev_s, prev_e in period_defs:
+                            cur_df = period_frames[("cur", cur_s, cur_e)]
+                            prev_df = period_frames[("prev", prev_s, prev_e)]
+
+                            if cur_df.empty or dimension_key not in cur_df.columns:
+                                cur_val = 0.0
+                            else:
+                                cur_mask = cur_df[dimension_key].map(_normalize_dimension_value) == dimension_name
+                                cur_val = float(cur_df[cur_mask]['total_ipus'].sum())
+
+                            if prev_df.empty or dimension_key not in prev_df.columns:
+                                prev_val = 0.0
+                            else:
+                                prev_mask = prev_df[dimension_key].map(_normalize_dimension_value) == dimension_name
+                                prev_val = float(prev_df[prev_mask]['total_ipus'].sum())
+
+                            lines.append(
+                                f"  {period_name}: {cur_val:,.2f} IPUs -> {prev_val:,.2f} previous "
+                                f"({_arrow_change(cur_val - prev_val)})"
+                            )
+
+                        lines.append("")
+
+                    return lines, dimension_values
+
                 report_lines = []
-                report_lines.append("Informatica Usage Summary")
-                report_lines.append(f"Prepared on {now_utc.strftime('%b')} {now_utc.day}, {now_utc.year} {now_utc.strftime('%H:%M UTC')}, data through {cur_end.strftime('%b')} {cur_end.day}")
-                report_lines.append("")
                 period_blocks = {
                     "past week": {
                         "enabled": show_week,
@@ -1635,10 +1717,6 @@ def display_historical_analysis():
                     },
                 }
 
-                report_lines.append("Selected time periods:")
-                report_lines.append(f"- {', '.join(selected_periods)}")
-                report_lines.append("")
-
                 if show_week:
                     report_lines.append(
                         f"Past week ({week_range_str}): total IPUs {total_week:,.2f} "
@@ -1659,43 +1737,14 @@ def display_historical_analysis():
 
                 report_lines.append("")
 
-                orgs_df = get_org_stats_by_date_range(week_cur_start.isoformat(), week_cur_end.isoformat()) if show_week else (
-                    get_org_stats_by_date_range(cur_start.isoformat(), cur_end.isoformat()) if show_month else get_org_stats_by_date_range(d30_cur_start.isoformat(), d30_cur_end.isoformat())
-                )
-                org_list = sorted([o for o in orgs_df['org'].tolist()]) if not orgs_df.empty else []
-                if org_list:
-                    for org_name in org_list:
-                        if show_week:
-                            wk = get_org_stats_by_date_range(week_cur_start.isoformat(), week_cur_end.isoformat())
-                            wk_val = float(wk[wk['org'] == org_name]['total_ipus'].sum()) if not wk.empty else 0.0
-                            wk_prev_val = float(get_org_stats_by_date_range(week_prev_start.isoformat(), week_prev_end.isoformat()).query("org == @org_name")['total_ipus'].sum()) if True else 0.0
-                        if show_month:
-                            mtd_val = float(get_org_stats_by_date_range(cur_start.isoformat(), cur_end.isoformat()).query("org == @org_name")['total_ipus'].sum()) if True else 0.0
-                            mtd_prev_val = float(get_org_stats_by_date_range(prev_start.isoformat(), prev_end.isoformat()).query("org == @org_name")['total_ipus'].sum()) if True else 0.0
-                        if show_30_days:
-                            d30_val = float(get_org_stats_by_date_range(d30_cur_start.isoformat(), d30_cur_end.isoformat()).query("org == @org_name")['total_ipus'].sum()) if True else 0.0
-                            d30_prev_val = float(get_org_stats_by_date_range(d30_prev_start.isoformat(), d30_prev_end.isoformat()).query("org == @org_name")['total_ipus'].sum()) if True else 0.0
+                report_lines.append("Organization comparison:")
+                org_lines, org_list = _build_dimension_summary_lines("Organization", "org", get_org_stats_by_date_range)
+                report_lines.extend(org_lines)
 
-                        report_lines.append(f"Organization: {org_name}")
-                        if show_week:
-                            report_lines.append(
-                                f"  Past week: {wk_val:,.2f} IPUs -> {wk_prev_val:,.2f} previous "
-                                f"({_arrow_change(wk_val - wk_prev_val)})"
-                            )
-                        if show_month:
-                            report_lines.append(
-                                f"  Past calendar month: {mtd_val:,.2f} IPUs -> {mtd_prev_val:,.2f} previous "
-                                f"({_arrow_change(mtd_val - mtd_prev_val)})"
-                            )
-                        if show_30_days:
-                            report_lines.append(
-                                f"  Past 30 days: {d30_val:,.2f} IPUs -> {d30_prev_val:,.2f} previous "
-                                f"({_arrow_change(d30_val - d30_prev_val)})"
-                            )
-                        report_lines.append("")
-                else:
-                    report_lines.append("No organization-level data available.")
-                    report_lines.append("")
+                if show_environment:
+                    report_lines.append("Environment comparison:")
+                    env_lines, _env_list = _build_dimension_summary_lines("Environment", "environment", get_environment_stats_by_date_range)
+                    report_lines.extend(env_lines)
 
                 proj_flags = pd.DataFrame()
                 def _detect_project_anomalies(cur_s, cur_e, prev_s, prev_e, label):
@@ -1923,8 +1972,13 @@ def display_historical_analysis():
                                 with cols[col_idx]:
                                     org_df = trend_eff[trend_eff['org'] == org_name].copy()
                                     if org_df.empty:
-                                        st.write(f"**{org_name}**")
-                                        st.info("No data")
+                                        weekly = pd.DataFrame(
+                                            {'total_ipus': [0.0] * len(week_index)},
+                                            index=week_index
+                                        )
+                                        st.markdown(f"**{org_name}**")
+                                        st.info("No output in the selected recent-week window.")
+                                        st.line_chart(weekly['total_ipus'], width='stretch', height=220)
                                         continue
                                     weekly = org_df.groupby('week_start', dropna=False).agg(total_ipus=('effective_ipus', 'sum')).reset_index()
                                     weekly['week_start'] = pd.to_datetime(weekly['week_start'])
