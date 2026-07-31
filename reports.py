@@ -180,8 +180,23 @@ def init_database():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    
-    # Create indices for efficient queries
+
+    # Migrate older DBs before creating indexes that depend on newer columns.
+    # CREATE TABLE IF NOT EXISTS does not add columns to an existing table.
+    cursor.execute("PRAGMA table_info(tasks)")
+    cols = [r[1] for r in cursor.fetchall()]
+    for column, ddl in [
+        ('row_hash', 'ALTER TABLE tasks ADD COLUMN row_hash TEXT'),
+        ('agent_name', 'ALTER TABLE tasks ADD COLUMN agent_name TEXT'),
+        ('log_type', 'ALTER TABLE tasks ADD COLUMN log_type TEXT'),
+    ]:
+        if column not in cols:
+            try:
+                cursor.execute(ddl)
+            except Exception:
+                pass
+
+    # Create indices for efficient queries (after migrations so columns exist)
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_start_time ON tasks(start_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_end_time ON tasks(end_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_org ON tasks(org)')
@@ -193,28 +208,6 @@ def init_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_log_type ON tasks(log_type)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_events_created_at ON history_events(created_at)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_events_action ON history_events(action)')
-
-    # If an existing DB was created before row_hash existed, try to add the column
-    cursor.execute("PRAGMA table_info(tasks)")
-    cols = [r[1] for r in cursor.fetchall()]
-    if 'row_hash' not in cols:
-        try:
-            cursor.execute('ALTER TABLE tasks ADD COLUMN row_hash TEXT')
-        except Exception:
-            # Some SQLite versions or locks may prevent altering; ignore if it fails
-            pass
-
-    if 'agent_name' not in cols:
-        try:
-            cursor.execute('ALTER TABLE tasks ADD COLUMN agent_name TEXT')
-        except Exception:
-            pass
-
-    if 'log_type' not in cols:
-        try:
-            cursor.execute('ALTER TABLE tasks ADD COLUMN log_type TEXT')
-        except Exception:
-            pass
 
     # Ensure unique index on row_hash to avoid inserting identical rows
     cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_row_hash ON tasks(row_hash)')
