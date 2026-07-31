@@ -1138,20 +1138,24 @@ def display_historical_analysis():
             )
             log_type = None if log_type_choice == "All" else log_type_choice
 
-        # Apply log-type filter to every historical query in this view
+        # Apply log-type filter to every historical query in this view.
+        # Bind from the reports module so we don't shadow the imported names
+        # before reading them (which raises UnboundLocalError).
         from functools import partial
-        get_tasks_by_date_range = partial(get_tasks_by_date_range, log_type=log_type)
-        get_daily_stats_by_date_range = partial(get_daily_stats_by_date_range, log_type=log_type)
-        get_org_stats_by_date_range = partial(get_org_stats_by_date_range, log_type=log_type)
-        get_project_stats_by_date_range = partial(get_project_stats_by_date_range, log_type=log_type)
-        get_environment_stats_by_date_range = partial(get_environment_stats_by_date_range, log_type=log_type)
-        get_agent_stats_by_date_range = partial(get_agent_stats_by_date_range, log_type=log_type)
-        get_task_type_stats_by_date_range = partial(get_task_type_stats_by_date_range, log_type=log_type)
-        get_status_stats_by_date_range = partial(get_status_stats_by_date_range, log_type=log_type)
-        detect_anomalies_in_date_range = partial(detect_anomalies_in_date_range, log_type=log_type)
-        get_task_spikes_for_period = partial(get_task_spikes_for_period, log_type=log_type)
-        count_tasks_by_date_range = partial(count_tasks_by_date_range, log_type=log_type)
-        delete_tasks_by_date_range = partial(delete_tasks_by_date_range, log_type=log_type)
+        import reports as _reports
+
+        get_tasks_by_date_range = partial(_reports.get_tasks_by_date_range, log_type=log_type)
+        get_daily_stats_by_date_range = partial(_reports.get_daily_stats_by_date_range, log_type=log_type)
+        get_org_stats_by_date_range = partial(_reports.get_org_stats_by_date_range, log_type=log_type)
+        get_project_stats_by_date_range = partial(_reports.get_project_stats_by_date_range, log_type=log_type)
+        get_environment_stats_by_date_range = partial(_reports.get_environment_stats_by_date_range, log_type=log_type)
+        get_agent_stats_by_date_range = partial(_reports.get_agent_stats_by_date_range, log_type=log_type)
+        get_task_type_stats_by_date_range = partial(_reports.get_task_type_stats_by_date_range, log_type=log_type)
+        get_status_stats_by_date_range = partial(_reports.get_status_stats_by_date_range, log_type=log_type)
+        detect_anomalies_in_date_range = partial(_reports.detect_anomalies_in_date_range, log_type=log_type)
+        get_task_spikes_for_period = partial(_reports.get_task_spikes_for_period, log_type=log_type)
+        count_tasks_by_date_range = partial(_reports.count_tasks_by_date_range, log_type=log_type)
+        delete_tasks_by_date_range = partial(_reports.delete_tasks_by_date_range, log_type=log_type)
 
         missing_ranges = get_missing_task_date_ranges(min_date, max_date, log_type=log_type)
         if missing_ranges:
