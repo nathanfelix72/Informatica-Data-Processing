@@ -13,6 +13,7 @@ from pathlib import Path
 import hashlib
 import logging
 import calculations
+from processing import _to_datetime_mixed
 
 # Prefer pytz if available, otherwise fall back to zoneinfo (Python 3.9+)
 try:
@@ -211,9 +212,147 @@ def init_database():
 
     # Ensure unique index on row_hash to avoid inserting identical rows
     cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_row_hash ON tasks(row_hash)')
+
+    # Mass Ingestion rows are tracked as distinct orgs (e.g. "BYU-Dev Mass Ingestion")
+    # so they never combine with Task Usage for the same base name.
+    _migrate_mass_ingestion_orgs(cursor, conn)
+    _migrate_mass_ingestion_ipu_factor(cursor)
     
     conn.commit()
     conn.close()
+
+
+def _migrate_mass_ingestion_orgs(cursor, conn):
+    """Rename Mass Ingestion orgs and recompute row hashes for dedupe consistency."""
+    from mappings import mass_ingestion_org_name, MASS_INGESTION_ORG_SUFFIX
+
+    cursor.execute(
+        """
+        SELECT COUNT(*) FROM tasks
+        WHERE log_type = 'Mass Ingestion'
+          AND org IS NOT NULL
+          AND TRIM(org) != ''
+          AND org NOT LIKE ?
+        """,
+        (f'%{MASS_INGESTION_ORG_SUFFIX}',),
+    )
+    pending = cursor.fetchone()[0]
+    if not pending:
+        return
+
+    rows = pd.read_sql_query(
+        """
+        SELECT task_record_id, task_id, task_run_id, task_name, task_type,
+               project_name, folder_name, org, environment, agent_name,
+               log_type, start_time, end_time, metered_value
+        FROM tasks
+        WHERE log_type = 'Mass Ingestion'
+          AND org IS NOT NULL
+          AND TRIM(org) != ''
+          AND org NOT LIKE ?
+        """,
+        conn,
+        params=(f'%{MASS_INGESTION_ORG_SUFFIX}',),
+    )
+    if rows.empty:
+        return
+
+    rows['org'] = rows['org'].map(mass_ingestion_org_name)
+    # Match save_run hashing: numeric metered values rounded, nulls -> 0
+    rows['metered_value'] = pd.to_numeric(rows['metered_value'], errors='coerce').round(6).fillna(0)
+    for dt_col in ['start_time', 'end_time']:
+        rows[dt_col] = rows[dt_col].fillna('').astype(str)
+
+    # Mirror the display-column order used by save_run
+    display_order = [
+        'Task ID', 'Task Run ID', 'Task Name', 'Task Type', 'Project Name',
+        'Folder Name', 'Org', 'Environment', 'Agent Name', 'Log Type',
+        'Start Time', 'End Time', 'Metered Value',
+    ]
+    rename_map = {
+        'task_id': 'Task ID',
+        'task_run_id': 'Task Run ID',
+        'task_name': 'Task Name',
+        'task_type': 'Task Type',
+        'project_name': 'Project Name',
+        'folder_name': 'Folder Name',
+        'org': 'Org',
+        'environment': 'Environment',
+        'agent_name': 'Agent Name',
+        'log_type': 'Log Type',
+        'start_time': 'Start Time',
+        'end_time': 'End Time',
+        'metered_value': 'Metered Value',
+    }
+    hash_frame = rows.rename(columns=rename_map)[display_order]
+    new_hashes = _compute_row_hashes(hash_frame, display_order)
+
+    updates = list(zip(
+        rows['org'].tolist(),
+        new_hashes,
+        rows['task_record_id'].tolist(),
+    ))
+    cursor.executemany(
+        'UPDATE tasks SET org = ?, row_hash = ? WHERE task_record_id = ?',
+        updates,
+    )
+
+
+def _migrate_mass_ingestion_ipu_factor(cursor):
+    """Recalculate Mass Ingestion IPUs/costs with the 0.1 conversion factor."""
+    mi_factor = float(calculations.MASS_INGESTION_IPU_CONVERSION_FACTOR)
+    cost_per_ipu = float(calculations.COST_PER_IPU_MONTH)
+
+    # Skip when already on the MI factor (within rounding tolerance).
+    cursor.execute(
+        """
+        SELECT COUNT(*) FROM tasks
+        WHERE log_type = 'Mass Ingestion'
+          AND metered_value IS NOT NULL
+          AND ABS(
+                COALESCE(ipus, 0)
+                - ROUND(COALESCE(metered_value, 0) * ?, 8)
+              ) > 0.0000001
+        """,
+        (mi_factor,),
+    )
+    pending = cursor.fetchone()[0]
+    if not pending:
+        return
+
+    cursor.execute(
+        """
+        UPDATE tasks
+        SET ipus = ROUND(COALESCE(metered_value, 0) * ?, 8),
+            cost = ROUND(COALESCE(metered_value, 0) * ? * ?, 6)
+        WHERE log_type = 'Mass Ingestion'
+        """,
+        (mi_factor, mi_factor, cost_per_ipu),
+    )
+
+
+def _ipu_fallback_sql() -> tuple[str, list]:
+    """SQL expression + params for metered→IPU using log-type-aware factors."""
+    mi_factor = float(calculations.MASS_INGESTION_IPU_CONVERSION_FACTOR)
+    tu_factor = float(calculations.IPU_CONVERSION_FACTOR)
+    expr = (
+        "COALESCE(metered_value, 0) * "
+        "CASE WHEN log_type = 'Mass Ingestion' THEN ? ELSE ? END"
+    )
+    return expr, [mi_factor, tu_factor]
+
+
+def _effective_ipu_sql() -> tuple[str, list]:
+    """COALESCE(stored ipus, metered * log-type factor)."""
+    fallback_expr, fallback_params = _ipu_fallback_sql()
+    return f"COALESCE(ipus, {fallback_expr})", fallback_params
+
+
+def _effective_cost_sql() -> tuple[str, list]:
+    """COALESCE(stored cost, effective_ipus * cost_per_ipu)."""
+    ipu_expr, ipu_params = _effective_ipu_sql()
+    cost_per_ipu = float(calculations.COST_PER_IPU_MONTH)
+    return f"COALESCE(cost, ({ipu_expr}) * ?)", ipu_params + [cost_per_ipu]
 
 
 def _append_log_type_filter(query: str, params: list, log_type: str | None) -> tuple[str, list]:
@@ -329,7 +468,8 @@ def _summarize_date_ranges(frame: pd.DataFrame) -> tuple[str | None, str | None,
     date_series = None
     for candidate in ['End Time', 'Start Time']:
         if candidate in frame.columns:
-            parsed = pd.to_datetime(frame[candidate], errors='coerce', dayfirst=True).dropna()
+            # format='mixed' keeps ISO YYYY-MM-DD intact; dayfirst still handles DD/MM slash dates
+            parsed = _to_datetime_mixed(frame[candidate]).dropna()
             if not parsed.empty:
                 date_series = parsed.dt.date
                 break
@@ -360,6 +500,51 @@ def _summarize_date_ranges(frame: pd.DataFrame) -> tuple[str | None, str | None,
 
     label = '; '.join(_format_range(start, end) for start, end in ranges)
     return start_date, end_date, label
+
+
+def _hash_column_values(series: pd.Series) -> list[str]:
+    """Normalize a column to hash-stable strings (matching prior row-hash rules)."""
+    if pd.api.types.is_numeric_dtype(series):
+        values = series.to_numpy()
+        out = []
+        for v in values:
+            if v is None or (isinstance(v, float) and pd.isna(v)) or pd.isna(v):
+                out.append('')
+            else:
+                out.append(format(v, '.12g'))
+        return out
+
+    out = []
+    for v in series.to_numpy():
+        if v is None or (isinstance(v, float) and pd.isna(v)) or pd.isna(v):
+            out.append('')
+        else:
+            out.append(str(v))
+    return out
+
+
+def _compute_row_hashes(frame: pd.DataFrame, columns: list[str], progress_callback=None) -> list[str]:
+    """SHA256 row hashes without DataFrame.apply (too slow for ~1M rows)."""
+    if frame.empty:
+        return []
+
+    joined = None
+    for col in columns:
+        as_text = pd.Series(_hash_column_values(frame[col]), index=frame.index, dtype=object)
+        joined = as_text if joined is None else (joined + '|' + as_text)
+
+    values = joined.to_numpy()
+    total = len(values)
+    hashes = [''] * total
+    report_every = max(50_000, total // 20) if total else 1
+
+    for i, text in enumerate(values):
+        hashes[i] = hashlib.sha256(text.encode('utf-8')).hexdigest()
+        if progress_callback and (i + 1 == total or (i + 1) % report_every == 0):
+            pct = int(10 + ((i + 1) / total) * 25)
+            progress_callback(pct, f'Computed hashes for rows 0:{i + 1}')
+
+    return hashes
 
 
 def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None, str | None]:
@@ -404,6 +589,7 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
         conn.close()
         return 0, total_rows, None, None, None
 
+    progress_callback(2, f'Preparing {len(merged_df):,} rows for historical save...')
     processed_start_date, processed_end_date, processed_label = _summarize_date_ranges(merged_df)
 
     # Only stable task identity belongs in the dedupe hash.
@@ -423,49 +609,43 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
         conn.close()
         return 0, total_rows, None, None, None
 
-    def _compute_row_hash(row, cols):
-        parts = []
-        for c in cols:
-            v = row.get(c) if hasattr(row, 'get') else row[c]
-            if pd.isna(v):
-                s = ''
-            elif isinstance(v, (float, int)):
-                s = format(v, '.12g')
-            else:
-                s = str(v)
-            parts.append(s)
-        concat = '|'.join(parts)
-        return hashlib.sha256(concat.encode('utf-8')).hexdigest()
+    # Use a wider set of source columns for storage than we use for dedupe hashing.
+    insert_source_columns = [
+        'Task ID', 'Task Name', 'Task Type', 'Task Run ID',
+        'Agent Name', 'Project Name', 'Folder Name', 'Org', 'Environment', 'Status',
+        'Log Type', 'Start Time', 'End Time', 'IPUs', 'Cost/IPU/Month', 'Metered Value', 'Cores Used'
+    ]
+    present_source_columns = [col for col in insert_source_columns if col in merged_df.columns]
+    staging_df = merged_df[present_source_columns].copy()
 
-    norm_df = merged_df[available_columns].copy()
-
-    # Normalize datetimes and numerics (same as before)
-    for dt_col in ['Start Time', 'End Time', 'Start DateTime']:
-        if dt_col in norm_df.columns:
-            norm_df[dt_col] = pd.to_datetime(norm_df[dt_col], errors='coerce', dayfirst=True)
-            norm_df[dt_col] = norm_df[dt_col].dt.strftime('%Y-%m-%d %H:%M:%S')
-            norm_df[dt_col] = norm_df[dt_col].fillna('')
+    # Normalize datetimes once (format='mixed' keeps ISO dates intact; dayfirst handles DD/MM).
+    progress_callback(5, 'Normalizing timestamps...')
+    for dt_col in ['Start Time', 'End Time']:
+        if dt_col in staging_df.columns:
+            staging_df[dt_col] = _to_datetime_mixed(staging_df[dt_col])
+            staging_df[dt_col] = staging_df[dt_col].dt.strftime('%Y-%m-%d %H:%M:%S')
+            staging_df[dt_col] = staging_df[dt_col].fillna('')
 
     for num_col in ['IPUs', 'Cost/IPU/Month', 'Metered Value', 'Cores Used']:
-        if num_col in norm_df.columns:
-            norm_df[num_col] = pd.to_numeric(norm_df[num_col], errors='coerce')
-            norm_df[num_col] = norm_df[num_col].round(6)
-            norm_df[num_col] = norm_df[num_col].fillna(0)
+        if num_col in staging_df.columns:
+            staging_df[num_col] = pd.to_numeric(staging_df[num_col], errors='coerce')
+            staging_df[num_col] = staging_df[num_col].round(6)
 
-    # Compute row hash using one deterministic algorithm for every row.
-    total_rows = len(norm_df)
-    progress_callback(5, 'Computing deterministic row hashes...')
-    chunk_hash = 5000
-    norm_df['row_hash'] = ''
-    for start in range(0, total_rows, chunk_hash):
-        end = min(start + chunk_hash, total_rows)
-        subset = norm_df.iloc[start:end]
-        hashes = subset.apply(lambda r: _compute_row_hash(r, available_columns), axis=1)
-        norm_df.loc[subset.index, 'row_hash'] = hashes.values
-        pct = int(10 + (end / total_rows) * 20)
-        progress_callback(pct, f'Computed hashes for rows {start}:{end}')
+    # Hash from the same normalized staging frame used for insert.
+    progress_callback(8, 'Computing deterministic row hashes...')
+    hash_frame = staging_df[available_columns].copy()
+    for num_col in ['Metered Value']:
+        if num_col in hash_frame.columns:
+            hash_frame[num_col] = hash_frame[num_col].fillna(0)
+    staging_df['row_hash'] = _compute_row_hashes(hash_frame, available_columns, progress_callback)
 
-    # Prepare DataFrame for DB insert
+    progress_callback(40, 'Checking existing historical rows...')
+    existing_hashes = {
+        row[0] for row in cursor.execute('SELECT row_hash FROM tasks WHERE row_hash IS NOT NULL') if row[0]
+    }
+    new_rows_df = staging_df[~staging_df['row_hash'].isin(existing_hashes)].drop_duplicates(subset=['row_hash'])
+    _added_start_date, _added_end_date, added_label = _summarize_date_ranges(new_rows_df)
+
     col_map = {
         'Task ID': 'task_id',
         'Task Name': 'task_name',
@@ -486,74 +666,39 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
         'Cores Used': 'cores_used',
         'row_hash': 'row_hash',
     }
+    new_rows_df = new_rows_df.rename(columns=col_map)
 
-    # Use a wider set of source columns for storage than we use for dedupe hashing.
-    # Hash should be stable on task identity; persisted record should retain metrics.
-    insert_source_columns = [
-        'Task ID', 'Task Name', 'Task Type', 'Task Run ID',
-        'Agent Name', 'Project Name', 'Folder Name', 'Org', 'Environment', 'Status',
-        'Log Type', 'Start Time', 'End Time', 'IPUs', 'Cost/IPU/Month', 'Metered Value', 'Cores Used'
-    ]
-    present_source_columns = [col for col in insert_source_columns if col in merged_df.columns]
-
-    staging_df = merged_df[present_source_columns].copy()
-
-    for dt_col in ['Start Time', 'End Time']:
-        if dt_col in staging_df.columns:
-            staging_df[dt_col] = pd.to_datetime(staging_df[dt_col], errors='coerce', dayfirst=True)
-            staging_df[dt_col] = staging_df[dt_col].dt.strftime('%Y-%m-%d %H:%M:%S')
-            staging_df[dt_col] = staging_df[dt_col].fillna('')
-
-    for num_col in ['IPUs', 'Cost/IPU/Month', 'Metered Value', 'Cores Used']:
-        if num_col in staging_df.columns:
-            staging_df[num_col] = pd.to_numeric(staging_df[num_col], errors='coerce')
-            staging_df[num_col] = staging_df[num_col].round(6)
-
-    staging_df['row_hash'] = norm_df['row_hash'].values
-
-    existing_hashes = set()
-    cursor.execute('SELECT row_hash FROM tasks WHERE row_hash IS NOT NULL')
-    for existing_row in cursor.fetchall():
-        if existing_row[0]:
-            existing_hashes.add(existing_row[0])
-
-    new_rows_df = staging_df[~staging_df['row_hash'].isin(existing_hashes)].drop_duplicates(subset=['row_hash'])
-    added_start_date, added_end_date, added_label = _summarize_date_ranges(new_rows_df)
-
-    staging_df = staging_df.rename(columns=col_map)
-
-    # Determine insert columns that actually exist
     insert_cols = [
         col for col in [
             'task_id', 'task_name', 'task_type', 'task_run_id', 'row_hash',
             'agent_name', 'project_name', 'folder_name', 'org', 'environment', 'status',
             'log_type', 'start_time', 'end_time', 'ipus', 'cost', 'metered_value', 'cores_used'
-        ] if col in staging_df.columns
+        ] if col in new_rows_df.columns
     ]
 
-    # Count before
     cursor.execute('SELECT COUNT(*) FROM tasks')
     before_count = cursor.fetchone()[0]
 
-    # Perform chunked INSERT OR IGNORE
+    total_to_insert = len(new_rows_df)
+    if total_to_insert == 0:
+        progress_callback(100, 'No new rows to insert (all duplicates)')
+        conn.close()
+        return 0, before_count, None, None, None
+
+    progress_callback(45, f'Preparing {total_to_insert:,} new rows for insert...')
+    insert_df = new_rows_df[insert_cols].copy()
+    for col in insert_df.columns:
+        if insert_df[col].dtype == object:
+            insert_df[col] = insert_df[col].replace('', None)
+    insert_df = insert_df.where(insert_df.notna(), None)
+    tuples = list(insert_df.itertuples(index=False, name=None))
+
     placeholders = ','.join(['?'] * len(insert_cols))
     insert_sql = f"INSERT OR IGNORE INTO tasks ({', '.join(insert_cols)}) VALUES ({placeholders})"
 
-    # Convert to list of tuples for executemany (fill NaNs with None)
-    tuples = []
-    for row in staging_df[insert_cols].itertuples(index=False, name=None):
-        tuples.append(tuple(None if (pd.isna(x) or (isinstance(x, str) and x == '')) else x for x in row))
-
-    total_to_insert = len(tuples)
-    if total_to_insert == 0:
-        progress_callback(100, 'No rows to insert')
-        cursor.execute('SELECT COUNT(*) FROM tasks')
-        after_count = cursor.fetchone()[0]
-        conn.close()
-        return 0, after_count, None, None
-
-    chunk_size = 5000
+    chunk_size = 10_000
     processed = 0
+    report_every = max(chunk_size, total_to_insert // 20)
     conn.execute('BEGIN')
     try:
         for start in range(0, total_to_insert, chunk_size):
@@ -561,16 +706,16 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
             batch = tuples[start:end]
             cursor.executemany(insert_sql, batch)
             processed += len(batch)
-            pct = int(10 + (processed / total_to_insert) * 80)
-            progress_callback(pct, f'Inserted {processed:,}/{total_to_insert:,} staging rows')
+            if processed == total_to_insert or processed % report_every < chunk_size:
+                pct = int(45 + (processed / total_to_insert) * 50)
+                progress_callback(pct, f'Inserted {processed:,}/{total_to_insert:,} new rows')
             logger.info(f'Inserted batch rows {start}:{end} ({len(batch)} rows)')
         conn.commit()
-    except Exception as e:
+    except Exception:
         conn.rollback()
         logger.exception('Error during chunked insert')
         raise
 
-    # Final counts
     cursor.execute('SELECT COUNT(*) FROM tasks')
     after_count = cursor.fetchone()[0]
     rows_added = after_count - before_count
@@ -582,9 +727,7 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
             progress_callback(100, f'Finished. {rows_added} new rows added, {after_count} total rows')
         logger.info(f'Finished save_run: {rows_added} new rows, {after_count} total')
 
-        if added_label:
-            note = f'Added date range(s): {added_label}'
-
+        note = f'Added date range(s): {added_label}' if added_label else None
         record_history_event(
             'ADD',
             start_date=processed_start_date,
@@ -1018,6 +1161,12 @@ def get_missing_task_date_ranges(start_date, end_date, org: str = None, project:
 def get_org_coverage_gaps(start_date, end_date, log_type: str = None) -> pd.DataFrame:
     """Return per-org (and log type) coverage plus missing date ranges.
 
+    Gaps are holes *inside* each org/log-type's own first→last observed span
+    (intersected with the requested window). Days before an org's first upload
+    or after its last upload are not treated as missing — different exports
+    simply cover different periods (e.g. Campus-Prod may only have one month
+    while Prod Task Usage covers a full year).
+
     Source filenames are not stored on historical rows; organization is the
     label assigned at upload and is the best proxy for which spreadsheet
     coverage is missing.
@@ -1053,16 +1202,22 @@ def get_org_coverage_gaps(start_date, end_date, log_type: str = None) -> pd.Data
 
     daily['date'] = pd.to_datetime(daily['date'], errors='coerce').dt.date
     daily = daily.dropna(subset=['date'])
-    expected_dates = set(pd.date_range(start=start_dt, end=end_dt, freq='D').date)
 
     rows = []
     for (org, row_log_type), group in daily.groupby(['org', 'log_type'], dropna=False):
         present = {d for d in group['date'].tolist() if d is not None}
+        if not present:
+            continue
+
+        first_present = min(present)
+        last_present = max(present)
+        # Only look for holes inside this org's own coverage window.
+        span_start = max(start_dt, first_present)
+        span_end = min(end_dt, last_present)
+        expected_dates = set(pd.date_range(start=span_start, end=span_end, freq='D').date)
         missing = sorted(expected_dates - present)
         ranges = _collapse_dates_to_ranges(missing)
         range_labels = [format_display_date_range(start, end) for start, end in ranges]
-        first_present = min(present) if present else None
-        last_present = max(present) if present else None
         rows.append({
             'org': org,
             'log_type': row_log_type,
@@ -1150,18 +1305,18 @@ def get_daily_stats_by_date_range(start_date: str, end_date: str,
     init_database()
     conn = sqlite3.connect(DB_PATH)
 
-    ipu_factor = float(calculations.IPU_CONVERSION_FACTOR)
-    cost_per_ipu = float(calculations.COST_PER_IPU_MONTH)
+    ipu_expr, ipu_params = _effective_ipu_sql()
+    cost_expr, cost_params = _effective_cost_sql()
 
     query = (
         "SELECT DATE(end_time) AS date, "
         "COUNT(*) AS task_count, "
-        "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
-        "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost "
+        "COALESCE(SUM(" + ipu_expr + "), 0) AS total_ipus, "
+        "COALESCE(SUM(" + cost_expr + "), 0) AS total_cost "
         "FROM tasks "
         "WHERE end_time >= ? AND end_time <= ?"
     )
-    params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    params = ipu_params + cost_params + [f'{start_date} 00:00:00', f'{end_date} 23:59:59']
 
     if org:
         query += ' AND org = ?'
@@ -1190,22 +1345,50 @@ def get_org_stats_by_date_range(start_date: str, end_date: str,
     init_database()
     conn = sqlite3.connect(DB_PATH)
 
-    ipu_factor = float(calculations.IPU_CONVERSION_FACTOR)
-    cost_per_ipu = float(calculations.COST_PER_IPU_MONTH)
+    ipu_expr, ipu_params = _effective_ipu_sql()
+    cost_expr, cost_params = _effective_cost_sql()
 
     query = (
         "SELECT COALESCE(NULLIF(TRIM(org), ''), 'Unknown') AS org, COUNT(*) AS task_count, "
-        "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
-        "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
+        "COALESCE(SUM(" + ipu_expr + "), 0) AS total_ipus, "
+        "COALESCE(SUM(" + cost_expr + "), 0) AS total_cost, "
         "COUNT(DISTINCT task_id) AS unique_tasks "
         "FROM tasks WHERE end_time >= ? AND end_time <= ?"
     )
-    params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    params = ipu_params + cost_params + [f'{start_date} 00:00:00', f'{end_date} 23:59:59']
     query, params = _append_log_type_filter(query, params, log_type)
     query += " GROUP BY COALESCE(NULLIF(TRIM(org), ''), 'Unknown') ORDER BY total_ipus DESC"
     org_stats = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return org_stats
+
+
+def get_org_daily_stats_by_date_range(start_date: str, end_date: str,
+                                      log_type: str = None) -> pd.DataFrame:
+    """Daily IPU/task totals per organization without loading every task row."""
+    init_database()
+    conn = sqlite3.connect(DB_PATH)
+
+    ipu_expr, ipu_params = _effective_ipu_sql()
+    cost_expr, cost_params = _effective_cost_sql()
+
+    query = (
+        "SELECT DATE(end_time) AS date, "
+        "COALESCE(NULLIF(TRIM(org), ''), 'Unknown') AS org, "
+        "COUNT(*) AS task_count, "
+        "COALESCE(SUM(" + ipu_expr + "), 0) AS total_ipus, "
+        "COALESCE(SUM(" + cost_expr + "), 0) AS total_cost "
+        "FROM tasks WHERE end_time >= ? AND end_time <= ?"
+    )
+    params = ipu_params + cost_params + [f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    query, params = _append_log_type_filter(query, params, log_type)
+    query += (
+        " GROUP BY DATE(end_time), COALESCE(NULLIF(TRIM(org), ''), 'Unknown') "
+        "ORDER BY DATE(end_time), org"
+    )
+    daily = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return daily
 
 
 def get_project_stats_by_date_range(start_date: str, end_date: str,
@@ -1214,17 +1397,17 @@ def get_project_stats_by_date_range(start_date: str, end_date: str,
     init_database()
     conn = sqlite3.connect(DB_PATH)
 
-    ipu_factor = float(calculations.IPU_CONVERSION_FACTOR)
-    cost_per_ipu = float(calculations.COST_PER_IPU_MONTH)
+    ipu_expr, ipu_params = _effective_ipu_sql()
+    cost_expr, cost_params = _effective_cost_sql()
 
     query = (
         "SELECT project_name, COUNT(*) AS task_count, "
-        "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
-        "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
+        "COALESCE(SUM(" + ipu_expr + "), 0) AS total_ipus, "
+        "COALESCE(SUM(" + cost_expr + "), 0) AS total_cost, "
         "COUNT(DISTINCT task_id) AS unique_tasks "
         "FROM tasks WHERE end_time >= ? AND end_time <= ?"
     )
-    params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    params = ipu_params + cost_params + [f'{start_date} 00:00:00', f'{end_date} 23:59:59']
     query, params = _append_log_type_filter(query, params, log_type)
     query += " GROUP BY project_name ORDER BY total_ipus DESC"
     project_stats = pd.read_sql_query(query, conn, params=params)
@@ -1232,27 +1415,66 @@ def get_project_stats_by_date_range(start_date: str, end_date: str,
     return project_stats
 
 
+def _normalize_environment_base(name) -> str:
+    """Collapse infra variants into the shared environment label.
+
+    Examples:
+      'CES-Sandbox - AWS EC2' -> 'CES-Sandbox'
+      'CES-Sandbox - On-premise Linux agents' -> 'CES-Sandbox'
+      'BYU-Prod - AWS EC2 - DO NOT USE' -> 'BYU-Prod'
+      'Student Life' -> 'Student Life'
+    """
+    if name is None or (isinstance(name, float) and pd.isna(name)):
+        return 'Unknown'
+    text = str(name).strip()
+    if not text:
+        return 'Unknown'
+    if ' - ' in text:
+        return text.split(' - ', 1)[0].strip() or 'Unknown'
+    return text
+
+
 def get_environment_stats_by_date_range(start_date: str, end_date: str,
                                         log_type: str = None) -> pd.DataFrame:
-    """Get statistics by environment for a date range."""
+    """Get statistics by environment for a date range.
+
+    Environment names are consolidated by base label so infra suffixes
+    (AWS EC2, On-premise Linux agents, etc.) do not create separate rows.
+    """
     init_database()
     conn = sqlite3.connect(DB_PATH)
 
-    ipu_factor = float(calculations.IPU_CONVERSION_FACTOR)
-    cost_per_ipu = float(calculations.COST_PER_IPU_MONTH)
+    ipu_expr, ipu_params = _effective_ipu_sql()
+    cost_expr, cost_params = _effective_cost_sql()
 
     query = (
         "SELECT environment, COUNT(*) AS task_count, "
-        "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
-        "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
+        "COALESCE(SUM(" + ipu_expr + "), 0) AS total_ipus, "
+        "COALESCE(SUM(" + cost_expr + "), 0) AS total_cost, "
         "COUNT(DISTINCT task_id) AS unique_tasks "
         "FROM tasks WHERE end_time >= ? AND end_time <= ?"
     )
-    params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    params = ipu_params + cost_params + [f'{start_date} 00:00:00', f'{end_date} 23:59:59']
     query, params = _append_log_type_filter(query, params, log_type)
     query += " GROUP BY environment ORDER BY total_ipus DESC"
     env_stats = pd.read_sql_query(query, conn, params=params)
     conn.close()
+
+    if env_stats.empty:
+        return env_stats
+
+    env_stats['environment'] = env_stats['environment'].map(_normalize_environment_base)
+    env_stats = (
+        env_stats.groupby('environment', as_index=False)
+        .agg(
+            task_count=('task_count', 'sum'),
+            total_ipus=('total_ipus', 'sum'),
+            total_cost=('total_cost', 'sum'),
+            unique_tasks=('unique_tasks', 'sum'),
+        )
+        .sort_values('total_ipus', ascending=False)
+        .reset_index(drop=True)
+    )
     return env_stats
 
 
@@ -1262,17 +1484,17 @@ def get_agent_stats_by_date_range(start_date: str, end_date: str,
     init_database()
     conn = sqlite3.connect(DB_PATH)
 
-    ipu_factor = float(calculations.IPU_CONVERSION_FACTOR)
-    cost_per_ipu = float(calculations.COST_PER_IPU_MONTH)
+    ipu_expr, ipu_params = _effective_ipu_sql()
+    cost_expr, cost_params = _effective_cost_sql()
 
     query = (
         "SELECT agent_name, COUNT(*) AS task_count, "
-        "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
-        "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
+        "COALESCE(SUM(" + ipu_expr + "), 0) AS total_ipus, "
+        "COALESCE(SUM(" + cost_expr + "), 0) AS total_cost, "
         "COUNT(DISTINCT task_id) AS unique_tasks "
         "FROM tasks WHERE end_time >= ? AND end_time <= ?"
     )
-    params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    params = ipu_params + cost_params + [f'{start_date} 00:00:00', f'{end_date} 23:59:59']
     query, params = _append_log_type_filter(query, params, log_type)
     query += " GROUP BY agent_name ORDER BY total_ipus DESC"
     agent_stats = pd.read_sql_query(query, conn, params=params)
@@ -1285,23 +1507,51 @@ def get_log_type_stats_by_date_range(start_date: str, end_date: str) -> pd.DataF
     init_database()
     conn = sqlite3.connect(DB_PATH)
 
-    ipu_factor = float(calculations.IPU_CONVERSION_FACTOR)
-    cost_per_ipu = float(calculations.COST_PER_IPU_MONTH)
+    ipu_expr, ipu_params = _effective_ipu_sql()
+    cost_expr, cost_params = _effective_cost_sql()
 
     query = (
         "SELECT COALESCE(NULLIF(TRIM(log_type), ''), 'Task Usage') AS log_type, "
         "COUNT(*) AS task_count, "
-        "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
-        "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
+        "COALESCE(SUM(" + ipu_expr + "), 0) AS total_ipus, "
+        "COALESCE(SUM(" + cost_expr + "), 0) AS total_cost, "
         "COUNT(DISTINCT task_id) AS unique_tasks "
         "FROM tasks WHERE end_time >= ? AND end_time <= ? "
         "GROUP BY COALESCE(NULLIF(TRIM(log_type), ''), 'Task Usage') "
         "ORDER BY total_ipus DESC"
     )
-    params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    params = ipu_params + cost_params + [f'{start_date} 00:00:00', f'{end_date} 23:59:59']
     log_type_stats = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return log_type_stats
+
+
+def get_log_type_daily_stats_by_date_range(start_date: str, end_date: str,
+                                           log_type: str = None) -> pd.DataFrame:
+    """Daily IPU/task totals per log type without loading every task row."""
+    init_database()
+    conn = sqlite3.connect(DB_PATH)
+
+    ipu_expr, ipu_params = _effective_ipu_sql()
+    cost_expr, cost_params = _effective_cost_sql()
+
+    query = (
+        "SELECT DATE(end_time) AS date, "
+        "COALESCE(NULLIF(TRIM(log_type), ''), 'Task Usage') AS log_type, "
+        "COUNT(*) AS task_count, "
+        "COALESCE(SUM(" + ipu_expr + "), 0) AS total_ipus, "
+        "COALESCE(SUM(" + cost_expr + "), 0) AS total_cost "
+        "FROM tasks WHERE end_time >= ? AND end_time <= ?"
+    )
+    params = ipu_params + cost_params + [f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    query, params = _append_log_type_filter(query, params, log_type)
+    query += (
+        " GROUP BY DATE(end_time), COALESCE(NULLIF(TRIM(log_type), ''), 'Task Usage') "
+        "ORDER BY DATE(end_time), log_type"
+    )
+    daily = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return daily
 
 
 def get_task_type_stats_by_date_range(start_date: str, end_date: str,
@@ -1310,17 +1560,17 @@ def get_task_type_stats_by_date_range(start_date: str, end_date: str,
     init_database()
     conn = sqlite3.connect(DB_PATH)
 
-    ipu_factor = float(calculations.IPU_CONVERSION_FACTOR)
-    cost_per_ipu = float(calculations.COST_PER_IPU_MONTH)
+    ipu_expr, ipu_params = _effective_ipu_sql()
+    cost_expr, cost_params = _effective_cost_sql()
 
     query = (
         "SELECT task_type, COUNT(*) AS task_count, "
-        "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
-        "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
+        "COALESCE(SUM(" + ipu_expr + "), 0) AS total_ipus, "
+        "COALESCE(SUM(" + cost_expr + "), 0) AS total_cost, "
         "COUNT(DISTINCT task_id) AS unique_tasks "
         "FROM tasks WHERE end_time >= ? AND end_time <= ?"
     )
-    params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    params = ipu_params + cost_params + [f'{start_date} 00:00:00', f'{end_date} 23:59:59']
     query, params = _append_log_type_filter(query, params, log_type)
     query += " GROUP BY task_type ORDER BY total_ipus DESC"
     tasktype_stats = pd.read_sql_query(query, conn, params=params)
@@ -1334,16 +1584,16 @@ def get_status_stats_by_date_range(start_date: str, end_date: str,
     init_database()
     conn = sqlite3.connect(DB_PATH)
 
-    ipu_factor = float(calculations.IPU_CONVERSION_FACTOR)
-    cost_per_ipu = float(calculations.COST_PER_IPU_MONTH)
+    ipu_expr, ipu_params = _effective_ipu_sql()
+    cost_expr, cost_params = _effective_cost_sql()
 
     query = (
         "SELECT status, COUNT(*) AS task_count, "
-        "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
-        "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost "
+        "COALESCE(SUM(" + ipu_expr + "), 0) AS total_ipus, "
+        "COALESCE(SUM(" + cost_expr + "), 0) AS total_cost "
         "FROM tasks WHERE end_time >= ? AND end_time <= ?"
     )
-    params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    params = ipu_params + cost_params + [f'{start_date} 00:00:00', f'{end_date} 23:59:59']
     query, params = _append_log_type_filter(query, params, log_type)
     query += " GROUP BY status ORDER BY total_ipus DESC"
     status_stats = pd.read_sql_query(query, conn, params=params)
@@ -1416,23 +1666,20 @@ def get_task_spikes_for_period(
     baseline_end = current_start - timedelta(days=1)
     baseline_start = baseline_end - timedelta(days=baseline_days - 1)
 
-    ipu_factor = float(calculations.IPU_CONVERSION_FACTOR)
-    cost_per_ipu = float(calculations.COST_PER_IPU_MONTH)
+    ipu_expr, ipu_params = _effective_ipu_sql()
+    cost_expr, cost_params = _effective_cost_sql()
 
     query = (
         "SELECT DATE(end_time) AS task_date, "
         "task_name, task_id, org, project_name, "
         "COUNT(*) AS run_count, "
-        "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS daily_ipus, "
-        "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS daily_cost "
+        "COALESCE(SUM(" + ipu_expr + "), 0) AS daily_ipus, "
+        "COALESCE(SUM(" + cost_expr + "), 0) AS daily_cost "
         "FROM tasks "
         "WHERE end_time >= ? AND end_time <= ? "
         "AND task_name IS NOT NULL AND TRIM(task_name) <> '' "
     )
-    params = [
-        ipu_factor,
-        ipu_factor,
-        cost_per_ipu,
+    params = ipu_params + cost_params + [
         f'{baseline_start.isoformat()} 00:00:00',
         f'{end_dt.isoformat()} 23:59:59',
     ]

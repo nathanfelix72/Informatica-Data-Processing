@@ -15,6 +15,7 @@ Run with: streamlit run app.py
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import io
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -29,11 +30,15 @@ from processing import (
     LOG_TYPE_MASS_INGESTION,
     LOG_TYPE_TASK_USAGE,
 )
+from mappings import get_all_org_options, mass_ingestion_org_name, is_mass_ingestion_org
 from calculations import (
     calculate_cost_per_ipu_month,
     calculate_ipus,
+    calculate_ipus_by_log_type,
     set_cost_per_ipu_month,
     set_ipu_conversion_factor,
+    set_mass_ingestion_ipu_conversion_factor,
+    MASS_INGESTION_IPU_CONVERSION_FACTOR,
 )
 from reports import (
     save_run,
@@ -122,17 +127,28 @@ def display_sidebar():
     """Display sidebar with configuration options."""
     st.sidebar.header("Configuration")
     
-    # IPU conversion factor
+    # IPU conversion factor (Task Usage)
     ipu_factor = st.sidebar.number_input(
-        "IPU Conversion Factor",
-        min_value=0.1,
+        "IPU Conversion Factor (Task Usage)",
+        min_value=0.01,
         max_value=10.0,
         value=0.16,
         step=0.01,
-        help="Multiplier applied to Metered Value to calculate IPUs"
+        help="Multiplier applied to Metered Value for Task Usage IPUs"
     )
     st.session_state.ipu_factor = ipu_factor
     set_ipu_conversion_factor(ipu_factor)
+
+    mi_ipu_factor = st.sidebar.number_input(
+        "IPU Conversion Factor (Mass Ingestion)",
+        min_value=0.01,
+        max_value=10.0,
+        value=float(MASS_INGESTION_IPU_CONVERSION_FACTOR),
+        step=0.01,
+        help="Multiplier applied to Metered Value for Mass Ingestion IPUs"
+    )
+    st.session_state.mi_ipu_factor = mi_ipu_factor
+    set_mass_ingestion_ipu_conversion_factor(mi_ipu_factor)
     
     # Cost per IPU per month
     cost_per_ipu = st.sidebar.number_input(
@@ -167,9 +183,19 @@ def display_file_upload():
     org_assignments = {}
     log_type_assignments = {}
 
-    def infer_org_from_filename(filename, org_options, used_orgs):
-        """Guess the organization from the uploaded filename."""
+    def infer_org_from_filename(filename, org_options, used_orgs, log_type=None):
+        """Guess the organization from the uploaded filename.
+
+        Mass Ingestion files map to a distinct org label (e.g. BYU-Dev Mass Ingestion)
+        so they never share series with the matching Task Usage org.
+        """
         name = ''.join(ch for ch in filename.lower() if ch.isalnum())
+        is_mi = (
+            log_type == LOG_TYPE_MASS_INGESTION
+            or 'massingestion' in name
+            or 'massingest' in name
+            or (name.endswith('mi') and len(name) > 2)
+        )
 
         patterns = [
             ("cessb", "CES-Sandbox"),
@@ -184,13 +210,25 @@ def display_file_upload():
             ("byudev", "BYU-Dev"),
         ]
 
-        for token, org in patterns:
-            if token in name and org in org_options and org not in used_orgs:
-                return org
+        def candidate_for(base_org):
+            return mass_ingestion_org_name(base_org) if is_mi else base_org
 
         for token, org in patterns:
-            if token in name and org in org_options:
-                return org
+            candidate = candidate_for(org)
+            if token in name and candidate in org_options and candidate not in used_orgs:
+                return candidate
+
+        for token, org in patterns:
+            candidate = candidate_for(org)
+            if token in name and candidate in org_options:
+                return candidate
+
+        preferred = [
+            org for org in org_options
+            if org not in used_orgs and (is_mass_ingestion_org(org) == is_mi)
+        ]
+        if preferred:
+            return preferred[0]
 
         for org in org_options:
             if org not in used_orgs:
@@ -203,14 +241,20 @@ def display_file_upload():
         
         # Show org + log type selection for each file
         st.subheader("Select Organization and Log Type for Each File")
+        st.caption(
+            "Mass Ingestion files use their own org names (e.g. BYU-Dev Mass Ingestion) "
+            "so logs and charts stay separate from Task Usage."
+        )
         
-        org_options = ["BYU-Dev", "BYU-Int", "BYU-Prod", "BYU-Campus-Int", "BYU-Campus-Prod", "CES-Prod", "CES-Sandbox"]
+        org_options = get_all_org_options()
         used_orgs = set()
         
         for uploaded_file in uploaded_files:
             col1, col2, col3 = st.columns([3, 1, 1])
-            suggested_org = infer_org_from_filename(uploaded_file.name, org_options, used_orgs)
             detected_log_type = peek_log_type(uploaded_file)
+            suggested_org = infer_org_from_filename(
+                uploaded_file.name, org_options, used_orgs, detected_log_type
+            )
             with col1:
                 st.write(f"**{uploaded_file.name}**")
                 if detected_log_type == LOG_TYPE_MASS_INGESTION:
@@ -256,10 +300,11 @@ def display_file_upload():
                 st.session_state.merged_df_path = str(cache_path)
                 # Keep a small preview in session state for UI responsiveness
                 st.session_state.merged_preview = merged_df.head(2000)
+                st.session_state.merged_df_rows = len(merged_df)
                 st.session_state.upload_errors = errors
                 st.session_state.processing_complete = True
                 st.session_state.uploaded_files = uploaded_files  # Store for later reference
-                
+                st.session_state.run_full_current_analysis = False                
                 if errors:
                     with st.expander("Processing Errors", expanded=True):
                         for error in errors:
@@ -705,9 +750,10 @@ def display_time_series_analysis(df):
     df_time['Hour of Day'] = df_time[ts_col].dt.hour
 
     # Tab selection for different time granularities
-    time_tab1, time_tab2, time_tab3, time_tab4, time_tab5 = st.tabs([
+    time_tab1, time_tab2, time_tab3, time_tab4, time_tab5, time_tab6 = st.tabs([
         "Daily",
         "Daily by Org",
+        "Daily by Log Type",
         "Hourly",
         "Hourly by Org",
         "Task Duration",
@@ -763,6 +809,41 @@ def display_time_series_analysis(df):
             st.info("Org column not available")
 
     with time_tab3:
+        st.subheader("Daily Usage by Log Type")
+        if 'Log Type' in df_time.columns:
+            type_daily = df_time.groupby(['Date', 'Log Type']).agg({
+                'Task Run ID': 'count',
+                'IPUs': 'sum',
+                'Cost/IPU/Month': 'sum',
+            }).reset_index()
+            type_daily.columns = ['Date', 'Log Type', 'Task Count', 'Total IPUs', 'Total Cost']
+
+            type_ipu_pivot = type_daily.pivot_table(
+                index='Date',
+                columns='Log Type',
+                values='Total IPUs',
+                aggfunc='sum',
+            )
+            type_count_pivot = type_daily.pivot_table(
+                index='Date',
+                columns='Log Type',
+                values='Task Count',
+                aggfunc='sum',
+            )
+
+            if not type_ipu_pivot.empty:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**Daily IPUs by Log Type**")
+                    st.line_chart(type_ipu_pivot.sort_index().fillna(0), width="stretch")
+                with col2:
+                    st.markdown("**Daily Task Counts by Log Type**")
+                    st.line_chart(type_count_pivot.sort_index().fillna(0), width="stretch")
+                st.dataframe(type_daily.sort_values('Date'), width="stretch", height=400)
+        else:
+            st.info("Log Type column not available")
+
+    with time_tab4:
         st.subheader("Hourly Usage Summary (All Days Combined)")
         hourly_stats = df_time.groupby('Hour of Day').agg({
             'Task Run ID': 'count',
@@ -780,7 +861,7 @@ def display_time_series_analysis(df):
 
         st.dataframe(hourly_stats, width="stretch", height=400)
 
-    with time_tab4:
+    with time_tab5:
         st.subheader("Hourly Usage by Organization (All Days Combined)")
         if 'Org' in df_time.columns:
             org_hourly = df_time.groupby(['Hour of Day', 'Org']).agg({
@@ -803,7 +884,7 @@ def display_time_series_analysis(df):
         else:
             st.info("Org column not available")
     
-    with time_tab5:
+    with time_tab6:
         st.subheader("Task Duration Analysis")
         if 'End Time' in df_time.columns:
             df_duration = df_time.copy()
@@ -1152,6 +1233,7 @@ def display_historical_analysis():
         get_tasks_by_date_range = partial(_reports.get_tasks_by_date_range, log_type=log_type)
         get_daily_stats_by_date_range = partial(_reports.get_daily_stats_by_date_range, log_type=log_type)
         get_org_stats_by_date_range = partial(_reports.get_org_stats_by_date_range, log_type=log_type)
+        get_org_daily_stats_by_date_range = partial(_reports.get_org_daily_stats_by_date_range, log_type=log_type)
         get_project_stats_by_date_range = partial(_reports.get_project_stats_by_date_range, log_type=log_type)
         get_environment_stats_by_date_range = partial(_reports.get_environment_stats_by_date_range, log_type=log_type)
         get_agent_stats_by_date_range = partial(_reports.get_agent_stats_by_date_range, log_type=log_type)
@@ -1162,8 +1244,8 @@ def display_historical_analysis():
         count_tasks_by_date_range = partial(_reports.count_tasks_by_date_range, log_type=log_type)
         delete_tasks_by_date_range = partial(_reports.delete_tasks_by_date_range, log_type=log_type)
 
-        missing_ranges = get_missing_task_date_ranges(min_date, max_date, log_type=log_type)
-        coverage_gaps = get_org_coverage_gaps(min_date, max_date, log_type=log_type)
+        missing_ranges = get_missing_task_date_ranges(start_date, end_date, log_type=log_type)
+        coverage_gaps = get_org_coverage_gaps(start_date, end_date, log_type=log_type)
         orgs_with_gaps = (
             coverage_gaps[coverage_gaps['days_missing'] > 0]
             if not coverage_gaps.empty else coverage_gaps
@@ -1188,8 +1270,9 @@ def display_historical_analysis():
 
             if orgs_with_gaps is not None and not orgs_with_gaps.empty:
                 st.caption(
-                    "Gaps by organization (org is assigned when you upload each spreadsheet — "
-                    "source filenames are not stored in history)."
+                    "Gaps are missing days *inside* each org/log-type's own first→last coverage "
+                    "(not days before that org's first upload). Different exports often cover "
+                    "different periods — that alone is not a gap."
                 )
                 # Compact summary line: which orgs need files
                 org_summaries = []
@@ -1363,9 +1446,19 @@ def display_historical_analysis():
                 cost = pd.Series([pd.NA] * len(out), index=out.index)
 
             ipu_factor = float(st.session_state.get('ipu_factor', 0.16))
+            mi_ipu_factor = float(st.session_state.get('mi_ipu_factor', MASS_INGESTION_IPU_CONVERSION_FACTOR))
             cost_per_ipu = float(st.session_state.get('cost_per_ipu', 36.04))
 
-            out['effective_ipus'] = ipus.fillna(metered * ipu_factor).fillna(0)
+            if 'log_type' in out.columns:
+                factors = np.where(
+                    out['log_type'].fillna('').astype(str).str.strip() == LOG_TYPE_MASS_INGESTION,
+                    mi_ipu_factor,
+                    ipu_factor,
+                )
+            else:
+                factors = ipu_factor
+
+            out['effective_ipus'] = ipus.fillna(metered * factors).fillna(0)
             out['effective_cost'] = cost.fillna(out['effective_ipus'] * cost_per_ipu).fillna(0)
 
             for col in ['org', 'project_name', 'task_name']:
@@ -1642,11 +1735,22 @@ def display_historical_analysis():
         analysis_tab, history_tab = st.tabs(["Usage Analysis", "History Management"])
 
         with analysis_tab:
-            tab1, tab2, tab3, tab4, tab5 = st.tabs([
-                "Narrative Summary", "Daily Trends", "By Organization", "By Project", "Anomaly Detection"
-            ])
+            # Radios (not tabs): Streamlit runs every tab body on each rerun, which
+            # re-loads huge task frames and freezes the page after a refresh.
+            analysis_section = st.radio(
+                "Analysis section",
+                [
+                    "Narrative Summary",
+                    "Daily Trends",
+                    "By Organization",
+                    "By Project",
+                    "Anomaly Detection",
+                ],
+                horizontal=True,
+                key="historical_analysis_section",
+            )
 
-            with tab1:
+            if analysis_section == "Narrative Summary":
                 # Narrative Summary (copy-paste text) placed as first tab
                 st.subheader("Narrative Summary")
                 st.write("Copyable executive summary with totals, per-org lines, and anomaly bullets.")
@@ -1681,9 +1785,11 @@ def display_historical_analysis():
 
                 show_environment = st.checkbox(
                     "Show environments",
-                    value=False,
+                    value=True,
                     key="narrative_show_environment",
-                    help="Include environment-level comparisons in the narrative summary.",
+                    help="Include environment-level comparisons in the narrative summary. "
+                         "Variants like 'CES-Sandbox - AWS EC2' and "
+                         "'CES-Sandbox - On-premise Linux agents' are consolidated.",
                 )
 
                 selected_periods = [
@@ -1696,718 +1802,765 @@ def display_historical_analysis():
 
                 # (Spike past-weeks control moved below to sit under the Spike Task Charts header)
 
+                generate_narrative = st.button(
+                    "Generate narrative summary",
+                    type="primary",
+                    key="generate_narrative_summary",
+                    help="Heavy over large history — only runs when you click.",
+                )
+
                 if not selected_periods:
                     st.info("Turn on at least one time period to generate the narrative summary.")
-                    return
-
-                # Use the same analysis end bound as the rest of historical analysis
-                # (through yesterday / selected end), not a separate off-by-one window.
-                anchor = analysis_end
-
-                def _month_to_date_ranges(anchor_date):
-                    cur_start = anchor_date.replace(day=1)
-                    cur_end = anchor_date
-                    prev_month = (cur_start.month - 1) or 12
-                    prev_year = cur_start.year - 1 if cur_start.month == 1 else cur_start.year
-                    prev_start = cur_start.replace(year=prev_year, month=prev_month, day=1)
-                    from calendar import monthrange
-                    last_day_prev = monthrange(prev_year, prev_month)[1]
-                    prev_end_day = min(anchor_date.day, last_day_prev)
-                    prev_end = prev_start.replace(day=prev_end_day)
-                    return (cur_start, cur_end, prev_start, prev_end)
-
-                if compare_full_months:
-                    from calendar import monthrange
-                    if anchor.month == 1:
-                        cur_month = 12
-                        cur_year = anchor.year - 1
-                    else:
-                        cur_month = anchor.month - 1
-                        cur_year = anchor.year
-                    cur_start = anchor.replace(year=cur_year, month=cur_month, day=1)
-                    cur_last = monthrange(cur_year, cur_month)[1]
-                    cur_end = cur_start.replace(day=cur_last)
-                    if cur_month == 1:
-                        prev_month = 12
-                        prev_year = cur_year - 1
-                    else:
-                        prev_month = cur_month - 1
-                        prev_year = cur_year
-                    prev_start = cur_start.replace(year=prev_year, month=prev_month, day=1)
-                    prev_last = monthrange(prev_year, prev_month)[1]
-                    prev_end = prev_start.replace(day=prev_last)
-                else:
-                    cur_start, cur_end, prev_start, prev_end = _month_to_date_ranges(anchor)
-
-                week_cur_end = anchor
-                week_cur_start = anchor - timedelta(days=6)
-                week_prev_end = week_cur_start - timedelta(days=1)
-                week_prev_start = week_prev_end - timedelta(days=6)
-
-                d30_cur_end = anchor
-                d30_cur_start = anchor - timedelta(days=29)
-                d30_prev_end = d30_cur_start - timedelta(days=1)
-                d30_prev_start = d30_prev_end - timedelta(days=29)
-
-                def _total_ipus_for_range(s, e):
-                    df = get_daily_stats_by_date_range(s.isoformat(), e.isoformat())
-                    return float(df['total_ipus'].sum()) if not df.empty else 0.0
-
-                total_week = _total_ipus_for_range(week_cur_start, week_cur_end)
-                total_week_prev = _total_ipus_for_range(week_prev_start, week_prev_end)
-                total_30 = _total_ipus_for_range(d30_cur_start, d30_cur_end)
-                total_30_prev = _total_ipus_for_range(d30_prev_start, d30_prev_end)
-                total_mtd = _total_ipus_for_range(cur_start, cur_end)
-                total_mtd_prev = _total_ipus_for_range(prev_start, prev_end)
-
-                week_range_str = f"{week_cur_start.strftime('%b')} {week_cur_start.day} - {week_cur_end.strftime('%b')} {week_cur_end.day}"
-                mtd_range_str = f"{cur_start.strftime('%b')} {cur_start.day} - {cur_end.strftime('%b')} {cur_end.day}"
-                d30_range_str = f"{d30_cur_start.strftime('%b')} {d30_cur_start.day} - {d30_cur_end.strftime('%b')} {d30_cur_end.day}"
-
-                now_utc = datetime.now(timezone.utc)
-
-                def _arrow_change(value, precision=2):
-                    direction = "↑" if value >= 0 else "↓"
-                    return f"{direction} {abs(value):,.{precision}f}"
-
-                def _normalize_dimension_value(value):
-                    if pd.isna(value):
-                        return "(Unknown)"
-                    text = str(value).strip()
-                    return text if text else "(Unknown)"
-
-                def _build_dimension_summary_lines(dimension_label, dimension_key, stats_fn):
-                    period_defs = []
-                    if show_week:
-                        period_defs.append(("Past week", week_cur_start, week_cur_end, week_prev_start, week_prev_end))
-                    if show_month:
-                        period_defs.append(("Past calendar month", cur_start, cur_end, prev_start, prev_end))
-                    if show_30_days:
-                        period_defs.append(("Past 30 days", d30_cur_start, d30_cur_end, d30_prev_start, d30_prev_end))
-
-                    period_frames = {}
-                    for _, cur_s, cur_e, prev_s, prev_e in period_defs:
-                        period_frames[("cur", cur_s, cur_e)] = stats_fn(cur_s.isoformat(), cur_e.isoformat())
-                        period_frames[("prev", prev_s, prev_e)] = stats_fn(prev_s.isoformat(), prev_e.isoformat())
-
-                    dimension_values = sorted({
-                        _normalize_dimension_value(value)
-                        for frame in period_frames.values()
-                        if frame is not None and not frame.empty and dimension_key in frame.columns
-                        for value in frame[dimension_key].tolist()
-                    })
-
-                    lines = []
-                    if not dimension_values:
-                        filter_note = f" for log type '{log_type_choice}'" if log_type else ""
-                        lines.append(
-                            f"No {dimension_label.lower()}-level data available{filter_note} "
-                            f"in the selected period(s)."
+                elif not generate_narrative:
+                    cached = st.session_state.get("narrative_report_text")
+                    if cached:
+                        st.text_area(
+                            "Narrative Summary (cached)",
+                            value=cached,
+                            height=420,
+                            key="narrative_summary_cached_view",
                         )
-                        lines.append("")
-                        return lines, []
+                        st.caption("Click Generate again to rebuild with the current period options.")
+                    else:
+                        st.info("Click “Generate narrative summary” to build the report for the selected periods.")
 
-                    for dimension_name in dimension_values:
-                        lines.append(f"{dimension_label}: {dimension_name}")
-                        for period_name, cur_s, cur_e, prev_s, prev_e in period_defs:
-                            cur_df = period_frames[("cur", cur_s, cur_e)]
-                            prev_df = period_frames[("prev", prev_s, prev_e)]
+                if selected_periods and generate_narrative:
+                    # Use the same analysis end bound as the rest of historical analysis
+                    # (through yesterday / selected end), not a separate off-by-one window.
+                    anchor = analysis_end
 
-                            if cur_df.empty or dimension_key not in cur_df.columns:
-                                cur_val = 0.0
-                            else:
-                                cur_mask = cur_df[dimension_key].map(_normalize_dimension_value) == dimension_name
-                                cur_val = float(cur_df.loc[cur_mask, 'total_ipus'].sum()) if cur_mask.any() else 0.0
+                    def _month_to_date_ranges(anchor_date):
+                        cur_start = anchor_date.replace(day=1)
+                        cur_end = anchor_date
+                        prev_month = (cur_start.month - 1) or 12
+                        prev_year = cur_start.year - 1 if cur_start.month == 1 else cur_start.year
+                        prev_start = cur_start.replace(year=prev_year, month=prev_month, day=1)
+                        from calendar import monthrange
+                        last_day_prev = monthrange(prev_year, prev_month)[1]
+                        prev_end_day = min(anchor_date.day, last_day_prev)
+                        prev_end = prev_start.replace(day=prev_end_day)
+                        return (cur_start, cur_end, prev_start, prev_end)
 
-                            if prev_df.empty or dimension_key not in prev_df.columns:
-                                prev_val = 0.0
-                            else:
-                                prev_mask = prev_df[dimension_key].map(_normalize_dimension_value) == dimension_name
-                                prev_val = float(prev_df.loc[prev_mask, 'total_ipus'].sum()) if prev_mask.any() else 0.0
+                    if compare_full_months:
+                        from calendar import monthrange
+                        if anchor.month == 1:
+                            cur_month = 12
+                            cur_year = anchor.year - 1
+                        else:
+                            cur_month = anchor.month - 1
+                            cur_year = anchor.year
+                        cur_start = anchor.replace(year=cur_year, month=cur_month, day=1)
+                        cur_last = monthrange(cur_year, cur_month)[1]
+                        cur_end = cur_start.replace(day=cur_last)
+                        if cur_month == 1:
+                            prev_month = 12
+                            prev_year = cur_year - 1
+                        else:
+                            prev_month = cur_month - 1
+                            prev_year = cur_year
+                        prev_start = cur_start.replace(year=prev_year, month=prev_month, day=1)
+                        prev_last = monthrange(prev_year, prev_month)[1]
+                        prev_end = prev_start.replace(day=prev_last)
+                    else:
+                        cur_start, cur_end, prev_start, prev_end = _month_to_date_ranges(anchor)
 
+                    week_cur_end = anchor
+                    week_cur_start = anchor - timedelta(days=6)
+                    week_prev_end = week_cur_start - timedelta(days=1)
+                    week_prev_start = week_prev_end - timedelta(days=6)
+
+                    d30_cur_end = anchor
+                    d30_cur_start = anchor - timedelta(days=29)
+                    d30_prev_end = d30_cur_start - timedelta(days=1)
+                    d30_prev_start = d30_prev_end - timedelta(days=29)
+
+                    def _total_ipus_for_range(s, e):
+                        df = get_daily_stats_by_date_range(s.isoformat(), e.isoformat())
+                        return float(df['total_ipus'].sum()) if not df.empty else 0.0
+
+                    total_week = _total_ipus_for_range(week_cur_start, week_cur_end)
+                    total_week_prev = _total_ipus_for_range(week_prev_start, week_prev_end)
+                    total_30 = _total_ipus_for_range(d30_cur_start, d30_cur_end)
+                    total_30_prev = _total_ipus_for_range(d30_prev_start, d30_prev_end)
+                    total_mtd = _total_ipus_for_range(cur_start, cur_end)
+                    total_mtd_prev = _total_ipus_for_range(prev_start, prev_end)
+
+                    week_range_str = f"{week_cur_start.strftime('%b')} {week_cur_start.day} - {week_cur_end.strftime('%b')} {week_cur_end.day}"
+                    mtd_range_str = f"{cur_start.strftime('%b')} {cur_start.day} - {cur_end.strftime('%b')} {cur_end.day}"
+                    d30_range_str = f"{d30_cur_start.strftime('%b')} {d30_cur_start.day} - {d30_cur_end.strftime('%b')} {d30_cur_end.day}"
+
+                    now_utc = datetime.now(timezone.utc)
+
+                    def _arrow_change(value, precision=2):
+                        direction = "↑" if value >= 0 else "↓"
+                        return f"{direction} {abs(value):,.{precision}f}"
+
+                    def _normalize_dimension_value(value):
+                        if pd.isna(value):
+                            return "(Unknown)"
+                        text = str(value).strip()
+                        return text if text else "(Unknown)"
+
+                    def _build_dimension_summary_lines(dimension_label, dimension_key, stats_fn):
+                        period_defs = []
+                        if show_week:
+                            period_defs.append(("Past week", week_cur_start, week_cur_end, week_prev_start, week_prev_end))
+                        if show_month:
+                            period_defs.append(("Past calendar month", cur_start, cur_end, prev_start, prev_end))
+                        if show_30_days:
+                            period_defs.append(("Past 30 days", d30_cur_start, d30_cur_end, d30_prev_start, d30_prev_end))
+
+                        period_frames = {}
+                        for _, cur_s, cur_e, prev_s, prev_e in period_defs:
+                            period_frames[("cur", cur_s, cur_e)] = stats_fn(cur_s.isoformat(), cur_e.isoformat())
+                            period_frames[("prev", prev_s, prev_e)] = stats_fn(prev_s.isoformat(), prev_e.isoformat())
+
+                        dimension_values = sorted({
+                            _normalize_dimension_value(value)
+                            for frame in period_frames.values()
+                            if frame is not None and not frame.empty and dimension_key in frame.columns
+                            for value in frame[dimension_key].tolist()
+                        })
+
+                        lines = []
+                        if not dimension_values:
+                            filter_note = f" for log type '{log_type_choice}'" if log_type else ""
                             lines.append(
-                                f"  {period_name}: {cur_val:,.2f} IPUs -> {prev_val:,.2f} previous "
-                                f"({_arrow_change(cur_val - prev_val)})"
+                                f"No {dimension_label.lower()}-level data available{filter_note} "
+                                f"in the selected period(s)."
+                            )
+                            lines.append("")
+                            return lines, []
+
+                        for dimension_name in dimension_values:
+                            lines.append(f"{dimension_label}: {dimension_name}")
+                            for period_name, cur_s, cur_e, prev_s, prev_e in period_defs:
+                                cur_df = period_frames[("cur", cur_s, cur_e)]
+                                prev_df = period_frames[("prev", prev_s, prev_e)]
+
+                                if cur_df.empty or dimension_key not in cur_df.columns:
+                                    cur_val = 0.0
+                                else:
+                                    cur_mask = cur_df[dimension_key].map(_normalize_dimension_value) == dimension_name
+                                    cur_val = float(cur_df.loc[cur_mask, 'total_ipus'].sum()) if cur_mask.any() else 0.0
+
+                                if prev_df.empty or dimension_key not in prev_df.columns:
+                                    prev_val = 0.0
+                                else:
+                                    prev_mask = prev_df[dimension_key].map(_normalize_dimension_value) == dimension_name
+                                    prev_val = float(prev_df.loc[prev_mask, 'total_ipus'].sum()) if prev_mask.any() else 0.0
+
+                                lines.append(
+                                    f"  {period_name}: {cur_val:,.2f} IPUs -> {prev_val:,.2f} previous "
+                                    f"({_arrow_change(cur_val - prev_val)})"
+                                )
+
+                            lines.append("")
+
+                        return lines, dimension_values
+
+                    report_lines = []
+                    period_blocks = {
+                        "past week": {
+                            "enabled": show_week,
+                            "total": total_week,
+                            "previous_total": total_week_prev,
+                            "range_str": week_range_str,
+                            "current_start": week_cur_start,
+                            "current_end": week_cur_end,
+                            "previous_start": week_prev_start,
+                            "previous_end": week_prev_end,
+                            "label": "Past week",
+                            "display_label": "past week",
+                        },
+                        "past calendar month": {
+                            "enabled": show_month,
+                            "total": total_mtd,
+                            "previous_total": total_mtd_prev,
+                            "range_str": mtd_range_str,
+                            "current_start": cur_start,
+                            "current_end": cur_end,
+                            "previous_start": prev_start,
+                            "previous_end": prev_end,
+                            "label": "Past calendar month",
+                            "display_label": "past calendar month",
+                        },
+                        "past 30 days": {
+                            "enabled": show_30_days,
+                            "total": total_30,
+                            "previous_total": total_30_prev,
+                            "range_str": d30_range_str,
+                            "current_start": d30_cur_start,
+                            "current_end": d30_cur_end,
+                            "previous_start": d30_prev_start,
+                            "previous_end": d30_prev_end,
+                            "label": "Past 30 days",
+                            "display_label": "past 30 days",
+                        },
+                    }
+
+                    if show_week:
+                        report_lines.append(
+                            f"Past week ({week_range_str}): total IPUs {total_week:,.2f} "
+                            f"-> previous week {total_week_prev:,.2f} ({_arrow_change(total_week - total_week_prev)})"
+                        )
+
+                    if show_month:
+                        report_lines.append(
+                            f"Past calendar month ({mtd_range_str}): total IPUs {total_mtd:,.2f} "
+                            f"-> previous period {total_mtd_prev:,.2f} ({_arrow_change(total_mtd - total_mtd_prev)})"
+                        )
+
+                    if show_30_days:
+                        report_lines.append(
+                            f"Past 30 days ({d30_range_str}): total IPUs {total_30:,.2f} "
+                            f"-> previous 30-day period {total_30_prev:,.2f} ({_arrow_change(total_30 - total_30_prev)})"
+                        )
+
+                    report_lines.append("")
+
+                    # Explicit Task Usage vs Mass Ingestion split (when viewing All, or always show both sides)
+                    report_lines.append("Log type comparison:")
+                    log_lines, _log_list = _build_dimension_summary_lines(
+                        "Log type",
+                        "log_type",
+                        lambda s, e: get_log_type_stats_by_date_range(s, e),
+                    )
+                    report_lines.extend(log_lines)
+
+                    report_lines.append("Organization comparison:")
+                    org_lines, org_list = _build_dimension_summary_lines("Organization", "org", get_org_stats_by_date_range)
+                    report_lines.extend(org_lines)
+
+                    if show_environment:
+                        report_lines.append("Environment comparison:")
+                        env_lines, _env_list = _build_dimension_summary_lines("Environment", "environment", get_environment_stats_by_date_range)
+                        report_lines.extend(env_lines)
+
+                    proj_flags = pd.DataFrame()
+                    def _detect_project_anomalies(cur_s, cur_e, prev_s, prev_e, label):
+                        cur_raw = get_tasks_by_date_range(cur_s.isoformat(), cur_e.isoformat())
+                        prev_raw = get_tasks_by_date_range(prev_s.isoformat(), prev_e.isoformat())
+                        cur_eff = _effective_metrics(cur_raw)
+                        prev_eff = _effective_metrics(prev_raw)
+                        cur_grp = cur_eff.groupby(['org', 'project_name']).agg(total_ipus=('effective_ipus', 'sum')).reset_index()
+                        prev_grp = prev_eff.groupby(['org', 'project_name']).agg(total_ipus=('effective_ipus', 'sum')).reset_index()
+                        merged = cur_grp.merge(prev_grp, on=['org', 'project_name'], how='outer', suffixes=('_cur', '_prev')).fillna(0)
+                        merged['delta_ipus'] = merged['total_ipus_cur'] - merged['total_ipus_prev']
+                        flagged = merged[merged['delta_ipus'].abs() >= 5].copy()
+                        flagged['period'] = label
+                        return flagged
+
+                    proj_frames = []
+                    if show_week:
+                        proj_frames.append(_detect_project_anomalies(week_cur_start, week_cur_end, week_prev_start, week_prev_end, 'Past Week'))
+                    if show_month:
+                        proj_frames.append(_detect_project_anomalies(cur_start, cur_end, prev_start, prev_end, 'Month-to-date'))
+                    if show_30_days:
+                        proj_frames.append(_detect_project_anomalies(d30_cur_start, d30_cur_end, d30_prev_start, d30_prev_end, 'Past 30 Days'))
+
+                    proj_flags = pd.concat(proj_frames, ignore_index=True, sort=False) if proj_frames else pd.DataFrame()
+
+                    report_lines.append("Project anomalies:")
+                    if proj_flags.empty:
+                        report_lines.append("- None detected")
+                    else:
+                        period_order = {"Past Week": 0, "Month-to-date": 1, "Past 30 Days": 2}
+                        proj_flags = proj_flags.copy()
+                        proj_flags['period_rank'] = proj_flags['period'].map(period_order).fillna(99).astype(int)
+                        proj_flags['abs_delta'] = proj_flags['delta_ipus'].abs()
+                        for _, r in proj_flags.sort_values(['period_rank', 'abs_delta'], ascending=[True, False]).iterrows():
+                            report_lines.append(
+                                f"- {r['period']}: {r['org']} / {r['project_name']} "
+                                f"IPUs {r['total_ipus_prev']:.2f} -> {r['total_ipus_cur']:.2f} "
+                                f"({_arrow_change(r['delta_ipus'])})"
                             )
 
-                        lines.append("")
-
-                    return lines, dimension_values
-
-                report_lines = []
-                period_blocks = {
-                    "past week": {
-                        "enabled": show_week,
-                        "total": total_week,
-                        "previous_total": total_week_prev,
-                        "range_str": week_range_str,
-                        "current_start": week_cur_start,
-                        "current_end": week_cur_end,
-                        "previous_start": week_prev_start,
-                        "previous_end": week_prev_end,
-                        "label": "Past week",
-                        "display_label": "past week",
-                    },
-                    "past calendar month": {
-                        "enabled": show_month,
-                        "total": total_mtd,
-                        "previous_total": total_mtd_prev,
-                        "range_str": mtd_range_str,
-                        "current_start": cur_start,
-                        "current_end": cur_end,
-                        "previous_start": prev_start,
-                        "previous_end": prev_end,
-                        "label": "Past calendar month",
-                        "display_label": "past calendar month",
-                    },
-                    "past 30 days": {
-                        "enabled": show_30_days,
-                        "total": total_30,
-                        "previous_total": total_30_prev,
-                        "range_str": d30_range_str,
-                        "current_start": d30_cur_start,
-                        "current_end": d30_cur_end,
-                        "previous_start": d30_prev_start,
-                        "previous_end": d30_prev_end,
-                        "label": "Past 30 days",
-                        "display_label": "past 30 days",
-                    },
-                }
-
-                if show_week:
-                    report_lines.append(
-                        f"Past week ({week_range_str}): total IPUs {total_week:,.2f} "
-                        f"-> previous week {total_week_prev:,.2f} ({_arrow_change(total_week - total_week_prev)})"
-                    )
-
-                if show_month:
-                    report_lines.append(
-                        f"Past calendar month ({mtd_range_str}): total IPUs {total_mtd:,.2f} "
-                        f"-> previous period {total_mtd_prev:,.2f} ({_arrow_change(total_mtd - total_mtd_prev)})"
-                    )
-
-                if show_30_days:
-                    report_lines.append(
-                        f"Past 30 days ({d30_range_str}): total IPUs {total_30:,.2f} "
-                        f"-> previous 30-day period {total_30_prev:,.2f} ({_arrow_change(total_30 - total_30_prev)})"
-                    )
-
-                report_lines.append("")
-
-                report_lines.append("Organization comparison:")
-                org_lines, org_list = _build_dimension_summary_lines("Organization", "org", get_org_stats_by_date_range)
-                report_lines.extend(org_lines)
-
-                if show_environment:
-                    report_lines.append("Environment comparison:")
-                    env_lines, _env_list = _build_dimension_summary_lines("Environment", "environment", get_environment_stats_by_date_range)
-                    report_lines.extend(env_lines)
-
-                proj_flags = pd.DataFrame()
-                def _detect_project_anomalies(cur_s, cur_e, prev_s, prev_e, label):
-                    cur_raw = get_tasks_by_date_range(cur_s.isoformat(), cur_e.isoformat())
-                    prev_raw = get_tasks_by_date_range(prev_s.isoformat(), prev_e.isoformat())
-                    cur_eff = _effective_metrics(cur_raw)
-                    prev_eff = _effective_metrics(prev_raw)
-                    cur_grp = cur_eff.groupby(['org', 'project_name']).agg(total_ipus=('effective_ipus', 'sum')).reset_index()
-                    prev_grp = prev_eff.groupby(['org', 'project_name']).agg(total_ipus=('effective_ipus', 'sum')).reset_index()
-                    merged = cur_grp.merge(prev_grp, on=['org', 'project_name'], how='outer', suffixes=('_cur', '_prev')).fillna(0)
-                    merged['delta_ipus'] = merged['total_ipus_cur'] - merged['total_ipus_prev']
-                    flagged = merged[merged['delta_ipus'].abs() >= 5].copy()
-                    flagged['period'] = label
-                    return flagged
-
-                proj_frames = []
-                if show_week:
-                    proj_frames.append(_detect_project_anomalies(week_cur_start, week_cur_end, week_prev_start, week_prev_end, 'Past Week'))
-                if show_month:
-                    proj_frames.append(_detect_project_anomalies(cur_start, cur_end, prev_start, prev_end, 'Month-to-date'))
-                if show_30_days:
-                    proj_frames.append(_detect_project_anomalies(d30_cur_start, d30_cur_end, d30_prev_start, d30_prev_end, 'Past 30 Days'))
-
-                proj_flags = pd.concat(proj_frames, ignore_index=True, sort=False) if proj_frames else pd.DataFrame()
-
-                report_lines.append("Project anomalies:")
-                if proj_flags.empty:
-                    report_lines.append("- None detected")
-                else:
-                    period_order = {"Past Week": 0, "Month-to-date": 1, "Past 30 Days": 2}
-                    proj_flags = proj_flags.copy()
-                    proj_flags['period_rank'] = proj_flags['period'].map(period_order).fillna(99).astype(int)
-                    proj_flags['abs_delta'] = proj_flags['delta_ipus'].abs()
-                    for _, r in proj_flags.sort_values(['period_rank', 'abs_delta'], ascending=[True, False]).iterrows():
-                        report_lines.append(
-                            f"- {r['period']}: {r['org']} / {r['project_name']} "
-                            f"IPUs {r['total_ipus_prev']:.2f} -> {r['total_ipus_cur']:.2f} "
-                            f"({_arrow_change(r['delta_ipus'])})"
-                        )
-
-                report_lines.append("")
-
-                task_flags = pd.DataFrame()
-                def _detect_task_anomalies(cur_s, cur_e, prev_s, prev_e, label):
-                    cur_raw = get_tasks_by_date_range(cur_s.isoformat(), cur_e.isoformat())
-                    prev_raw = get_tasks_by_date_range(prev_s.isoformat(), prev_e.isoformat())
-                    cur_eff = _effective_metrics(cur_raw)
-                    prev_eff = _effective_metrics(prev_raw)
-                    cur_grp = cur_eff.groupby(['org', 'project_name', 'task_name']).agg(task_count=('task_name', 'count'), total_ipus=('effective_ipus', 'sum')).reset_index()
-                    prev_grp = prev_eff.groupby(['org', 'project_name', 'task_name']).agg(task_count=('task_name', 'count'), total_ipus=('effective_ipus', 'sum')).reset_index()
-                    merged = cur_grp.merge(prev_grp, on=['org', 'project_name', 'task_name'], how='outer', suffixes=('_cur', '_prev')).fillna(0)
-                    merged['delta_ipus'] = merged['total_ipus_cur'] - merged['total_ipus_prev']
-                    merged['delta_runs'] = merged['task_count_cur'] - merged['task_count_prev']
-                    flagged = merged[(merged['delta_ipus'].abs() >= 1) | (merged['delta_runs'].abs() > 50)].copy()
-                    flagged['period'] = label
-                    return flagged
-
-                task_flags = pd.concat([
-                    _detect_task_anomalies(week_cur_start, week_cur_end, week_prev_start, week_prev_end, 'Past Week'),
-                    _detect_task_anomalies(cur_start, cur_end, prev_start, prev_end, 'Month-to-date'),
-                    _detect_task_anomalies(d30_cur_start, d30_cur_end, d30_prev_start, d30_prev_end, 'Past 30 Days'),
-                ], ignore_index=True, sort=False)
-
-                report_lines.append("Task anomalies:")
-                if task_flags.empty:
-                    report_lines.append("- None detected")
-                else:
-                    task_flags = task_flags.copy()
-                    task_flags['change_type'] = task_flags.apply(
-                        lambda r: (
-                            'Starts' if (r['total_ipus_prev'] <= 0 and r['total_ipus_cur'] > 0)
-                            else 'Stops' if (r['total_ipus_prev'] > 0 and r['total_ipus_cur'] <= 0)
-                            else 'Changes'
-                        ),
-                        axis=1,
-                    )
-                    task_flags['abs_delta'] = task_flags['delta_ipus'].abs()
-                    report_lines.append("- Changes")
-                    changes_flags = task_flags[task_flags['change_type'] == 'Changes']
-                    if changes_flags.empty:
-                        report_lines.append("  - None detected")
-                    else:
-                        for period_name in ["Past Week", "Month-to-date", "Past 30 Days"]:
-                            if (period_name == "Past Week" and not show_week) or (period_name == "Month-to-date" and not show_month) or (period_name == "Past 30 Days" and not show_30_days):
-                                continue
-                            period_flags = changes_flags[changes_flags['period'] == period_name].sort_values('abs_delta', ascending=False)
-                            if period_flags.empty:
-                                continue
-                            report_lines.append(f"  - {period_name}")
-                            up_flags = period_flags[period_flags['delta_ipus'] > 0].sort_values('delta_ipus', ascending=False)
-                            down_flags = period_flags[period_flags['delta_ipus'] < 0].sort_values('delta_ipus', ascending=True)
-                            if not up_flags.empty:
-                                report_lines.append("    - Going up")
-                                for _, r in up_flags.iterrows():
-                                    report_lines.append(
-                                        f"      - {r['org']} / {r['project_name']} / {r['task_name']} "
-                                        f"IPUs {r['total_ipus_prev']:.2f} -> {r['total_ipus_cur']:.2f} "
-                                        f"({_arrow_change(r['delta_ipus'])}), "
-                                        f"Runs {int(r['task_count_prev']):d} -> {int(r['task_count_cur']):d} "
-                                        f"({_arrow_change(r['delta_runs'], precision=0)})"
-                                    )
-                            if not down_flags.empty:
-                                report_lines.append("    - Going down")
-                                for _, r in down_flags.iterrows():
-                                    report_lines.append(
-                                        f"      - {r['org']} / {r['project_name']} / {r['task_name']} "
-                                        f"IPUs {r['total_ipus_prev']:.2f} -> {r['total_ipus_cur']:.2f} "
-                                        f"({_arrow_change(r['delta_ipus'])}), "
-                                        f"Runs {int(r['task_count_prev']):d} -> {int(r['task_count_cur']):d} "
-                                        f"({_arrow_change(r['delta_runs'], precision=0)})"
-                                    )
-
                     report_lines.append("")
-                    report_lines.append("- Starts and stops")
-                    starts_stops_flags = task_flags[task_flags['change_type'].isin(['Starts', 'Stops'])]
-                    if starts_stops_flags.empty:
-                        report_lines.append("  - None detected")
+
+                    task_flags = pd.DataFrame()
+                    def _detect_task_anomalies(cur_s, cur_e, prev_s, prev_e, label):
+                        cur_raw = get_tasks_by_date_range(cur_s.isoformat(), cur_e.isoformat())
+                        prev_raw = get_tasks_by_date_range(prev_s.isoformat(), prev_e.isoformat())
+                        cur_eff = _effective_metrics(cur_raw)
+                        prev_eff = _effective_metrics(prev_raw)
+                        cur_grp = cur_eff.groupby(['org', 'project_name', 'task_name']).agg(task_count=('task_name', 'count'), total_ipus=('effective_ipus', 'sum')).reset_index()
+                        prev_grp = prev_eff.groupby(['org', 'project_name', 'task_name']).agg(task_count=('task_name', 'count'), total_ipus=('effective_ipus', 'sum')).reset_index()
+                        merged = cur_grp.merge(prev_grp, on=['org', 'project_name', 'task_name'], how='outer', suffixes=('_cur', '_prev')).fillna(0)
+                        merged['delta_ipus'] = merged['total_ipus_cur'] - merged['total_ipus_prev']
+                        merged['delta_runs'] = merged['task_count_cur'] - merged['task_count_prev']
+                        flagged = merged[(merged['delta_ipus'].abs() >= 1) | (merged['delta_runs'].abs() > 50)].copy()
+                        flagged['period'] = label
+                        return flagged
+
+                    task_frames = []
+                    if show_week:
+                        task_frames.append(_detect_task_anomalies(week_cur_start, week_cur_end, week_prev_start, week_prev_end, 'Past Week'))
+                    if show_month:
+                        task_frames.append(_detect_task_anomalies(cur_start, cur_end, prev_start, prev_end, 'Month-to-date'))
+                    if show_30_days:
+                        task_frames.append(_detect_task_anomalies(d30_cur_start, d30_cur_end, d30_prev_start, d30_prev_end, 'Past 30 Days'))
+                    task_flags = pd.concat(task_frames, ignore_index=True, sort=False) if task_frames else pd.DataFrame()
+
+                    report_lines.append("Task anomalies:")
+                    if task_flags.empty:
+                        report_lines.append("- None detected")
                     else:
-                        for period_name in ["Past Week", "Month-to-date", "Past 30 Days"]:
-                            if (period_name == "Past Week" and not show_week) or (period_name == "Month-to-date" and not show_month) or (period_name == "Past 30 Days" and not show_30_days):
-                                continue
-                            period_flags = starts_stops_flags[starts_stops_flags['period'] == period_name].sort_values('abs_delta', ascending=False)
-                            if period_flags.empty:
-                                continue
-                            report_lines.append(f"  - {period_name}")
-                            for change_type in ["Starts", "Stops"]:
-                                change_flags = period_flags[period_flags['change_type'] == change_type]
-                                if change_flags.empty:
-                                    continue
-                                report_lines.append(f"    - {change_type}")
-                                for _, r in change_flags.iterrows():
-                                    report_lines.append(
-                                        f"      - {r['org']} / {r['project_name']} / {r['task_name']} "
-                                        f"IPUs {r['total_ipus_prev']:.2f} -> {r['total_ipus_cur']:.2f} "
-                                        f"({_arrow_change(r['delta_ipus'])}), "
-                                        f"Runs {int(r['task_count_prev']):d} -> {int(r['task_count_cur']):d} "
-                                        f"({_arrow_change(r['delta_runs'], precision=0)})"
-                                    )
-
-                def _add_task_spikes_section(title, end_date, lookback_days, baseline_days):
-                    report_lines.append("")
-                    report_lines.append(title)
-                    spikes = get_task_spikes_for_period(
-                        end_date=end_date,
-                        lookback_days=lookback_days,
-                        baseline_days=baseline_days,
-                        threshold_std=3.0,
-                        min_baseline_days=5,
-                        top_n=10,
-                    )
-                    if spikes.empty:
-                        report_lines.append("- No task showed a major spike versus prior baseline.")
-                        return
-
-                    report_lines.append(f"- {len(spikes)} task spike(s) flagged. Top items:")
-                    for _, row in spikes.head(5).iterrows():
-                        report_lines.append(
-                            f"  - {_fmt_date(pd.to_datetime(row['task_date']).date())}: {row['task_name']} in {row['org']} / {row['project_name']} "
-                            f"ran materially above baseline (about {row['multiplier_vs_baseline']:.1f}x)."
+                        task_flags = task_flags.copy()
+                        task_flags['change_type'] = task_flags.apply(
+                            lambda r: (
+                                'Starts' if (r['total_ipus_prev'] <= 0 and r['total_ipus_cur'] > 0)
+                                else 'Stops' if (r['total_ipus_prev'] > 0 and r['total_ipus_cur'] <= 0)
+                                else 'Changes'
+                            ),
+                            axis=1,
                         )
-
-                if show_week:
-                    _add_task_spikes_section(
-                        "Task Spikes (Past Week):",
-                        anchor.isoformat(),
-                        7,
-                        7,
-                    )
-
-                if show_month:
-                    month_window_days = (cur_end - cur_start).days + 1
-                    _add_task_spikes_section(
-                        "Task Spikes (Month):",
-                        cur_end.isoformat(),
-                        month_window_days,
-                        month_window_days,
-                    )
-
-                if show_30_days:
-                    _add_task_spikes_section(
-                        "Task Spikes (Rolling Month):",
-                        anchor.isoformat(),
-                        30,
-                        30,
-                    )
-
-                st.text_area("Copy/Paste Report", value="\n".join(report_lines), height=520)
-
-                # --- New: Per-organization 6-week weekly trends for screenshotting ---
-                try:
-                    st.divider()
-                    st.subheader("Org Weekly Trends (last 6 weeks)")
-
-                    weeks = 6
-                    anchor_ts = pd.to_datetime(anchor)
-                    # align anchor to week start (Monday)
-                    anchor_week_start = anchor_ts - pd.Timedelta(days=anchor_ts.weekday())
-                    start_week_start = anchor_week_start - pd.Timedelta(days=7 * (weeks - 1))
-
-                    trend_start_iso = start_week_start.date().isoformat()
-                    trend_end_iso = anchor_ts.date().isoformat()
-
-                    trend_tasks = get_tasks_by_date_range(trend_start_iso, trend_end_iso)
-
-                    if trend_tasks.empty:
-                        st.info("No data available for org weekly trends")
-                    else:
-                        trend_eff = _effective_metrics(trend_tasks)
-                        # derive week_start column (Timestamp at week start)
-                        if 'end_time' in trend_eff.columns:
-                            trend_eff['week_start'] = pd.to_datetime(trend_eff['end_time'], errors='coerce').dt.to_period('W').apply(lambda p: p.start_time)
-                        elif 'start_time' in trend_eff.columns:
-                            trend_eff['week_start'] = pd.to_datetime(trend_eff['start_time'], errors='coerce').dt.to_period('W').apply(lambda p: p.start_time)
+                        task_flags['abs_delta'] = task_flags['delta_ipus'].abs()
+                        report_lines.append("- Changes")
+                        changes_flags = task_flags[task_flags['change_type'] == 'Changes']
+                        if changes_flags.empty:
+                            report_lines.append("  - None detected")
                         else:
-                            trend_eff['week_start'] = pd.to_datetime(trend_eff['Run Date'], errors='coerce').dt.to_period('W').apply(lambda p: p.start_time)
-
-                        # Build canonical week index
-                        week_index = pd.date_range(start=start_week_start.normalize(), periods=weeks, freq='7D')
-
-                        # Render org charts in a grid: 3 per row
-                        for i in range(0, len(org_list), 3):
-                            row_orgs = org_list[i:i+3]
-                            cols = st.columns(3)
-                            for col_idx, org_name in enumerate(row_orgs):
-                                with cols[col_idx]:
-                                    org_df = trend_eff[trend_eff['org'] == org_name].copy()
-                                    if org_df.empty:
-                                        weekly = pd.DataFrame(
-                                            {'total_ipus': [0.0] * len(week_index)},
-                                            index=week_index
+                            for period_name in ["Past Week", "Month-to-date", "Past 30 Days"]:
+                                if (period_name == "Past Week" and not show_week) or (period_name == "Month-to-date" and not show_month) or (period_name == "Past 30 Days" and not show_30_days):
+                                    continue
+                                period_flags = changes_flags[changes_flags['period'] == period_name].sort_values('abs_delta', ascending=False)
+                                if period_flags.empty:
+                                    continue
+                                report_lines.append(f"  - {period_name}")
+                                up_flags = period_flags[period_flags['delta_ipus'] > 0].sort_values('delta_ipus', ascending=False)
+                                down_flags = period_flags[period_flags['delta_ipus'] < 0].sort_values('delta_ipus', ascending=True)
+                                if not up_flags.empty:
+                                    report_lines.append("    - Going up")
+                                    for _, r in up_flags.iterrows():
+                                        report_lines.append(
+                                            f"      - {r['org']} / {r['project_name']} / {r['task_name']} "
+                                            f"IPUs {r['total_ipus_prev']:.2f} -> {r['total_ipus_cur']:.2f} "
+                                            f"({_arrow_change(r['delta_ipus'])}), "
+                                            f"Runs {int(r['task_count_prev']):d} -> {int(r['task_count_cur']):d} "
+                                            f"({_arrow_change(r['delta_runs'], precision=0)})"
                                         )
-                                        st.markdown(f"**{org_name}**")
-                                        st.info("No output in the selected recent-week window.")
-                                        st.line_chart(weekly['total_ipus'], width='stretch', height=220)
-                                        continue
-                                    weekly = org_df.groupby('week_start', dropna=False).agg(total_ipus=('effective_ipus', 'sum')).reset_index()
-                                    weekly['week_start'] = pd.to_datetime(weekly['week_start'])
-                                    weekly = weekly.set_index('week_start').reindex(week_index, fill_value=0.0)
-                                    weekly.index = pd.to_datetime(weekly.index)
+                                if not down_flags.empty:
+                                    report_lines.append("    - Going down")
+                                    for _, r in down_flags.iterrows():
+                                        report_lines.append(
+                                            f"      - {r['org']} / {r['project_name']} / {r['task_name']} "
+                                            f"IPUs {r['total_ipus_prev']:.2f} -> {r['total_ipus_cur']:.2f} "
+                                            f"({_arrow_change(r['delta_ipus'])}), "
+                                            f"Runs {int(r['task_count_prev']):d} -> {int(r['task_count_cur']):d} "
+                                            f"({_arrow_change(r['delta_runs'], precision=0)})"
+                                        )
 
-                                    st.markdown(f"**{org_name}**")
-                                    st.line_chart(weekly['total_ipus'], width='stretch', height=220)
-
-                except Exception:
-                    # don't crash the report UI if charting fails
-                    st.warning('Unable to render org weekly trends')
-
-                # --- New: Plot recent task-level spikes/anomalies as small charts ---
-                try:
-                    st.divider()
-                    st.subheader('Spike Task Charts (recent weeks)')
-
-                    # Show an input here so the user can choose how many past weeks to include
-                    spike_past_weeks = st.number_input(
-                        "Past weeks to include for spike charts",
-                        min_value=1,
-                        max_value=52,
-                        value=int(st.session_state.get('spike_past_weeks', 3)),
-                        step=1,
-                        help="Enter how many past weeks to include when building spike task charts",
-                        key="spike_past_weeks_inline",
-                    )
-
-                    # Convert weeks to days for lookback window
-                    spike_window_days = int(spike_past_weeks) * 7
-                    spikes = get_task_spikes_for_period(
-                        end_date=anchor.isoformat(),
-                        lookback_days=spike_window_days,
-                        baseline_days=spike_window_days,
-                        threshold_std=3.0,
-                        min_baseline_days=5,
-                        top_n=10,
-                    )
-
-                    if spikes.empty:
-                        st.info('No recent task spikes to show')
-                    else:
-                        # Prefer to show the same tasks and ordering as the narrative "Changes" report
-                        try:
-                            raw_range_start = (anchor - timedelta(days=spike_window_days - 1)).isoformat()
-                            raw_range_end = anchor.isoformat()
-                            raw_tasks = get_tasks_by_date_range(raw_range_start, raw_range_end)
-                        except Exception:
-                            raw_tasks = pd.DataFrame()
-
-                        if raw_tasks.empty:
-                            st.info('No raw task rows available for spike charts')
+                        report_lines.append("")
+                        report_lines.append("- Starts and stops")
+                        starts_stops_flags = task_flags[task_flags['change_type'].isin(['Starts', 'Stops'])]
+                        if starts_stops_flags.empty:
+                            report_lines.append("  - None detected")
                         else:
-                            raw_eff = _effective_metrics(raw_tasks)
+                            for period_name in ["Past Week", "Month-to-date", "Past 30 Days"]:
+                                if (period_name == "Past Week" and not show_week) or (period_name == "Month-to-date" and not show_month) or (period_name == "Past 30 Days" and not show_30_days):
+                                    continue
+                                period_flags = starts_stops_flags[starts_stops_flags['period'] == period_name].sort_values('abs_delta', ascending=False)
+                                if period_flags.empty:
+                                    continue
+                                report_lines.append(f"  - {period_name}")
+                                for change_type in ["Starts", "Stops"]:
+                                    change_flags = period_flags[period_flags['change_type'] == change_type]
+                                    if change_flags.empty:
+                                        continue
+                                    report_lines.append(f"    - {change_type}")
+                                    for _, r in change_flags.iterrows():
+                                        report_lines.append(
+                                            f"      - {r['org']} / {r['project_name']} / {r['task_name']} "
+                                            f"IPUs {r['total_ipus_prev']:.2f} -> {r['total_ipus_cur']:.2f} "
+                                            f"({_arrow_change(r['delta_ipus'])}), "
+                                            f"Runs {int(r['task_count_prev']):d} -> {int(r['task_count_cur']):d} "
+                                            f"({_arrow_change(r['delta_runs'], precision=0)})"
+                                        )
 
-                            # Build the ordered list from task_flags (if available) else fallback to spikes
-                            ordered_tasks = []
+                    def _add_task_spikes_section(title, end_date, lookback_days, baseline_days):
+                        report_lines.append("")
+                        report_lines.append(title)
+                        spikes = get_task_spikes_for_period(
+                            end_date=end_date,
+                            lookback_days=lookback_days,
+                            baseline_days=baseline_days,
+                            threshold_std=3.0,
+                            min_baseline_days=5,
+                            top_n=10,
+                        )
+                        if spikes.empty:
+                            report_lines.append("- No task showed a major spike versus prior baseline.")
+                            return
+
+                        report_lines.append(f"- {len(spikes)} task spike(s) flagged. Top items:")
+                        for _, row in spikes.head(5).iterrows():
+                            report_lines.append(
+                                f"  - {_fmt_date(pd.to_datetime(row['task_date']).date())}: {row['task_name']} in {row['org']} / {row['project_name']} "
+                                f"ran materially above baseline (about {row['multiplier_vs_baseline']:.1f}x)."
+                            )
+
+                    if show_week:
+                        _add_task_spikes_section(
+                            "Task Spikes (Past Week):",
+                            anchor.isoformat(),
+                            7,
+                            7,
+                        )
+
+                    if show_month:
+                        month_window_days = (cur_end - cur_start).days + 1
+                        _add_task_spikes_section(
+                            "Task Spikes (Month):",
+                            cur_end.isoformat(),
+                            month_window_days,
+                            month_window_days,
+                        )
+
+                    if show_30_days:
+                        _add_task_spikes_section(
+                            "Task Spikes (Rolling Month):",
+                            anchor.isoformat(),
+                            30,
+                            30,
+                        )
+
+                    st.text_area("Copy/Paste Report", value="\n".join(report_lines), height=520)
+                    st.session_state["narrative_report_text"] = "\n".join(report_lines)
+
+                    # --- New: Per-organization 6-week weekly trends for screenshotting ---
+                    try:
+                        st.divider()
+                        st.subheader("Org Weekly Trends (last 6 weeks)")
+
+                        weeks = 6
+                        anchor_ts = pd.to_datetime(anchor)
+                        # align anchor to week start (Monday)
+                        anchor_week_start = anchor_ts - pd.Timedelta(days=anchor_ts.weekday())
+                        start_week_start = anchor_week_start - pd.Timedelta(days=7 * (weeks - 1))
+
+                        trend_start_iso = start_week_start.date().isoformat()
+                        trend_end_iso = anchor_ts.date().isoformat()
+
+                        trend_tasks = get_tasks_by_date_range(trend_start_iso, trend_end_iso)
+
+                        if trend_tasks.empty:
+                            st.info("No data available for org weekly trends")
+                        else:
+                            trend_eff = _effective_metrics(trend_tasks)
+                            # derive week_start column (Timestamp at week start)
+                            if 'end_time' in trend_eff.columns:
+                                trend_eff['week_start'] = pd.to_datetime(trend_eff['end_time'], errors='coerce').dt.to_period('W').apply(lambda p: p.start_time)
+                            elif 'start_time' in trend_eff.columns:
+                                trend_eff['week_start'] = pd.to_datetime(trend_eff['start_time'], errors='coerce').dt.to_period('W').apply(lambda p: p.start_time)
+                            else:
+                                trend_eff['week_start'] = pd.to_datetime(trend_eff['Run Date'], errors='coerce').dt.to_period('W').apply(lambda p: p.start_time)
+
+                            # Build canonical week index
+                            week_index = pd.date_range(start=start_week_start.normalize(), periods=weeks, freq='7D')
+
+                            # Include every org in the trend window (Mass Ingestion is its own org)
+                            # plus any orgs already listed in the narrative summary.
+                            trend_orgs = []
+                            if 'org' in trend_eff.columns and not trend_eff.empty:
+                                trend_orgs = [
+                                    _normalize_dimension_value(v)
+                                    for v in trend_eff['org'].tolist()
+                                ]
+                            chart_orgs = sorted({
+                                *(org_list or []),
+                                *trend_orgs,
+                            })
+
+                            # Render org charts in a grid: 3 per row
+                            for i in range(0, len(chart_orgs), 3):
+                                row_orgs = chart_orgs[i:i+3]
+                                cols = st.columns(3)
+                                for col_idx, org_name in enumerate(row_orgs):
+                                    with cols[col_idx]:
+                                        org_df = trend_eff[
+                                            trend_eff['org'].map(_normalize_dimension_value) == org_name
+                                        ].copy() if 'org' in trend_eff.columns else pd.DataFrame()
+                                        if org_df.empty:
+                                            weekly = pd.DataFrame(
+                                                {'total_ipus': [0.0] * len(week_index)},
+                                                index=week_index
+                                            )
+                                            st.markdown(f"**{org_name}**")
+                                            st.info("No output in the selected recent-week window.")
+                                            st.line_chart(weekly['total_ipus'], width='stretch', height=220)
+                                            continue
+                                        weekly = org_df.groupby('week_start', dropna=False).agg(total_ipus=('effective_ipus', 'sum')).reset_index()
+                                        weekly['week_start'] = pd.to_datetime(weekly['week_start'])
+                                        weekly = weekly.set_index('week_start').reindex(week_index, fill_value=0.0)
+                                        weekly.index = pd.to_datetime(weekly.index)
+
+                                        st.markdown(f"**{org_name}**")
+                                        st.line_chart(weekly['total_ipus'], width='stretch', height=220)
+
+                    except Exception:
+                        # don't crash the report UI if charting fails
+                        st.warning('Unable to render org weekly trends')
+
+                    # --- New: Plot recent task-level spikes/anomalies as small charts ---
+                    try:
+                        st.divider()
+                        st.subheader('Spike Task Charts (recent weeks)')
+
+                        # Show an input here so the user can choose how many past weeks to include
+                        spike_past_weeks = st.number_input(
+                            "Past weeks to include for spike charts",
+                            min_value=1,
+                            max_value=52,
+                            value=int(st.session_state.get('spike_past_weeks', 3)),
+                            step=1,
+                            help="Enter how many past weeks to include when building spike task charts",
+                            key="spike_past_weeks_inline",
+                        )
+
+                        # Convert weeks to days for lookback window
+                        spike_window_days = int(spike_past_weeks) * 7
+                        spikes = get_task_spikes_for_period(
+                            end_date=anchor.isoformat(),
+                            lookback_days=spike_window_days,
+                            baseline_days=spike_window_days,
+                            threshold_std=3.0,
+                            min_baseline_days=5,
+                            top_n=10,
+                        )
+
+                        if spikes.empty:
+                            st.info('No recent task spikes to show')
+                        else:
+                            # Prefer to show the same tasks and ordering as the narrative "Changes" report
                             try:
-                                # task_flags exists earlier in this scope and contains delta_ipus/delta_runs
-                                if 'task_flags' in locals() and not task_flags.empty:
-                                    # mirror the report ordering: Changes -> Past Week -> Going up then Going down
-                                    changes_flags = task_flags[task_flags['change_type'] == 'Changes'].copy()
-                                    # keep only Past Week entries for narrative context
-                                    pw = changes_flags[changes_flags['period'] == 'Past Week'] if 'Past Week' in changes_flags['period'].values else changes_flags
-                                    if not pw.empty:
-                                        pw = pw.copy()
-                                        pw['abs_delta'] = pw['delta_ipus'].abs()
-                                        pw = pw.sort_values('abs_delta', ascending=False)
-                                        # order: all positive delta_ipus then negative
-                                        up = pw[pw['delta_ipus'] > 0]
-                                        down = pw[pw['delta_ipus'] < 0]
-                                        ordered_df = pd.concat([up, down], ignore_index=True)
-                                        ordered_tasks = ordered_df[['org', 'project_name', 'task_name', 'delta_ipus', 'delta_runs']].drop_duplicates().to_dict('records')
+                                raw_range_start = (anchor - timedelta(days=spike_window_days - 1)).isoformat()
+                                raw_range_end = anchor.isoformat()
+                                raw_tasks = get_tasks_by_date_range(raw_range_start, raw_range_end)
                             except Exception:
+                                raw_tasks = pd.DataFrame()
+
+                            if raw_tasks.empty:
+                                st.info('No raw task rows available for spike charts')
+                            else:
+                                raw_eff = _effective_metrics(raw_tasks)
+
+                                # Build the ordered list from task_flags (if available) else fallback to spikes
                                 ordered_tasks = []
+                                try:
+                                    # task_flags exists earlier in this scope and contains delta_ipus/delta_runs
+                                    if 'task_flags' in locals() and not task_flags.empty:
+                                        # mirror the report ordering: Changes -> Past Week -> Going up then Going down
+                                        changes_flags = task_flags[task_flags['change_type'] == 'Changes'].copy()
+                                        # keep only Past Week entries for narrative context
+                                        pw = changes_flags[changes_flags['period'] == 'Past Week'] if 'Past Week' in changes_flags['period'].values else changes_flags
+                                        if not pw.empty:
+                                            pw = pw.copy()
+                                            pw['abs_delta'] = pw['delta_ipus'].abs()
+                                            pw = pw.sort_values('abs_delta', ascending=False)
+                                            # order: all positive delta_ipus then negative
+                                            up = pw[pw['delta_ipus'] > 0]
+                                            down = pw[pw['delta_ipus'] < 0]
+                                            ordered_df = pd.concat([up, down], ignore_index=True)
+                                            ordered_tasks = ordered_df[['org', 'project_name', 'task_name', 'delta_ipus', 'delta_runs']].drop_duplicates().to_dict('records')
+                                except Exception:
+                                    ordered_tasks = []
 
-                            # fallback: use spikes list (unique task/project/org order by z_score)
-                            if not ordered_tasks:
-                                dedup = spikes.drop_duplicates(subset=['task_name', 'org', 'project_name'])
-                                dedup = dedup.sort_values(['z_score', 'daily_ipus'], ascending=[False, False])
-                                ordered_tasks = dedup[['org', 'project_name', 'task_name']].head(12).to_dict('records')
+                                # fallback: use spikes list (unique task/project/org order by z_score)
+                                if not ordered_tasks:
+                                    dedup = spikes.drop_duplicates(subset=['task_name', 'org', 'project_name'])
+                                    dedup = dedup.sort_values(['z_score', 'daily_ipus'], ascending=[False, False])
+                                    ordered_tasks = dedup[['org', 'project_name', 'task_name']].head(12).to_dict('records')
 
-                            # limit to top_n
-                            top_n = 12
-                            ordered_tasks = ordered_tasks[:top_n]
+                                # limit to top_n
+                                top_n = 12
+                                ordered_tasks = ordered_tasks[:top_n]
 
-                            # Separate entries into IPU-driven and Run-driven lists
-                            ipu_entries = []
-                            run_entries = []
+                                # Separate entries into IPU-driven and Run-driven lists
+                                ipu_entries = []
+                                run_entries = []
 
-                            for entry in ordered_tasks:
-                                org_n = entry.get('org')
-                                project_n = entry.get('project_name')
-                                task_name = entry.get('task_name')
+                                for entry in ordered_tasks:
+                                    org_n = entry.get('org')
+                                    project_n = entry.get('project_name')
+                                    task_name = entry.get('task_name')
 
-                                mask = (
-                                    raw_eff['task_name'].astype(str) == str(task_name)
-                                ) & (
-                                    raw_eff['org'].astype(str) == str(org_n)
-                                ) & (
-                                    raw_eff['project_name'].astype(str) == str(project_n)
-                                )
-                                task_hist = raw_eff[mask].copy()
-                                if task_hist.empty:
-                                    continue
+                                    mask = (
+                                        raw_eff['task_name'].astype(str) == str(task_name)
+                                    ) & (
+                                        raw_eff['org'].astype(str) == str(org_n)
+                                    ) & (
+                                        raw_eff['project_name'].astype(str) == str(project_n)
+                                    )
+                                    task_hist = raw_eff[mask].copy()
+                                    if task_hist.empty:
+                                        continue
 
-                                if 'end_time' in task_hist.columns:
-                                    task_hist['date'] = pd.to_datetime(task_hist['end_time'], errors='coerce').dt.date
-                                elif 'start_time' in task_hist.columns:
-                                    task_hist['date'] = pd.to_datetime(task_hist['start_time'], errors='coerce').dt.date
-                                else:
-                                    task_hist['date'] = pd.to_datetime(task_hist['Run Date'], errors='coerce').dt.date
-
-                                daily = task_hist.groupby('date').agg(
-                                    total_ipus=('effective_ipus', 'sum'),
-                                    runs=('task_name', 'count')
-                                ).reset_index()
-
-                                if daily.empty:
-                                    continue
-
-                                daily['date'] = pd.to_datetime(daily['date'])
-                                daily = daily.set_index('date').sort_index()
-
-                                # heuristics to decide run vs ipu
-                                delta_runs = entry.get('delta_runs', None)
-
-                                mean_ipu = daily['total_ipus'].mean() if 'total_ipus' in daily.columns else 0.0
-                                peak_ipu = daily['total_ipus'].max() if 'total_ipus' in daily.columns else 0.0
-                                mult_ipu = (peak_ipu / mean_ipu) if mean_ipu > 0 else (peak_ipu if peak_ipu > 0 else 0.0)
-
-                                mean_runs = daily['runs'].mean() if 'runs' in daily.columns else 0.0
-                                peak_runs = daily['runs'].max() if 'runs' in daily.columns else 0.0
-                                mult_runs = (peak_runs / mean_runs) if mean_runs > 0 else (peak_runs if peak_runs > 0 else 0.0)
-
-                                choose_runs = False
-                                if delta_runs is not None and abs(delta_runs) > 50:
-                                    choose_runs = True
-                                elif mult_runs > mult_ipu:
-                                    choose_runs = True
-
-                                record = {
-                                    'org': org_n,
-                                    'project_name': project_n,
-                                    'task_name': task_name,
-                                    'daily': daily,
-                                    'choose_runs': choose_runs,
-                                    'delta_ipus': entry.get('delta_ipus', None),
-                                    'delta_runs': entry.get('delta_runs', None),
-                                }
-
-                                if choose_runs:
-                                    run_entries.append(record)
-                                else:
-                                    ipu_entries.append(record)
-
-                            def _split_and_sort(entries, metric_key, precision=2):
-                                up = []
-                                down = []
-                                for rec in entries:
-                                    # Prefer explicit delta from task_flags if available
-                                    spike_val = None
-                                    if metric_key == 'total_ipus' and rec.get('delta_ipus') is not None:
-                                        spike_val = float(rec.get('delta_ipus'))
-                                    if metric_key == 'runs' and rec.get('delta_runs') is not None:
-                                        spike_val = float(rec.get('delta_runs'))
-
-                                    daily = rec['daily']
-                                    series = daily[metric_key]
-                                    if spike_val is None:
-                                        peak_val = series.max()
-                                        mean_val = series.mean()
-                                        spike_val = peak_val - mean_val
-                                    rec['spike_val'] = spike_val
-                                    # classify by spike sign
-                                    if spike_val >= 0:
-                                        up.append(rec)
+                                    if 'end_time' in task_hist.columns:
+                                        task_hist['date'] = pd.to_datetime(task_hist['end_time'], errors='coerce').dt.date
+                                    elif 'start_time' in task_hist.columns:
+                                        task_hist['date'] = pd.to_datetime(task_hist['start_time'], errors='coerce').dt.date
                                     else:
-                                        down.append(rec)
-                                # sort by absolute spike magnitude desc
-                                up = sorted(up, key=lambda r: abs(r.get('spike_val', 0)), reverse=True)
-                                down = sorted(down, key=lambda r: abs(r.get('spike_val', 0)), reverse=True)
-                                return up, down
+                                        task_hist['date'] = pd.to_datetime(task_hist['Run Date'], errors='coerce').dt.date
 
-                            # Render IPU-driven spikes first, split into Going Up / Going Down (collapsible)
-                            if ipu_entries:
-                                with st.expander('IPU-driven Spike Charts', expanded=False):
-                                    ipu_up, ipu_down = _split_and_sort(ipu_entries, 'total_ipus', precision=2)
+                                    daily = task_hist.groupby('date').agg(
+                                        total_ipus=('effective_ipus', 'sum'),
+                                        runs=('task_name', 'count')
+                                    ).reset_index()
 
-                                    if ipu_up:
-                                        with st.expander('Going Up', expanded=False):
-                                            for i in range(0, len(ipu_up), 3):
-                                                row = ipu_up[i:i+3]
-                                                cols = st.columns(3)
-                                                for col_idx, rec in enumerate(row):
-                                                    with cols[col_idx]:
-                                                        org_n = rec['org']
-                                                        project_n = rec['project_name']
-                                                        task_name = rec['task_name']
-                                                        daily = rec['daily']
-                                                        series = daily['total_ipus']
-                                                        chart_title = f"{task_name} — {org_n} / {project_n} (IPUs)"
-                                                        st.markdown(f"**{chart_title}**")
-                                                        spike_val = rec.get('spike_val', 0)
-                                                        st.metric('Spike', _arrow_change(spike_val, precision=2), delta='(compared to last week)')
-                                                        st.line_chart(series, width='stretch', height=260)
+                                    if daily.empty:
+                                        continue
 
-                                    if ipu_down:
-                                        with st.expander('Going Down', expanded=False):
-                                            for i in range(0, len(ipu_down), 3):
-                                                row = ipu_down[i:i+3]
-                                                cols = st.columns(3)
-                                                for col_idx, rec in enumerate(row):
-                                                    with cols[col_idx]:
-                                                        org_n = rec['org']
-                                                        project_n = rec['project_name']
-                                                        task_name = rec['task_name']
-                                                        daily = rec['daily']
-                                                        series = daily['total_ipus']
-                                                        chart_title = f"{task_name} — {org_n} / {project_n} (IPUs)"
-                                                        st.markdown(f"**{chart_title}**")
-                                                        spike_val = rec.get('spike_val', 0)
-                                                        st.metric('Spike', _arrow_change(spike_val, precision=2), delta='(compared to last week)')
-                                                        st.line_chart(series, width='stretch', height=260)
+                                    daily['date'] = pd.to_datetime(daily['date'])
+                                    daily = daily.set_index('date').sort_index()
 
-                            # Then render Run-driven spikes, split into Going Up / Going Down
-                            if run_entries:
-                                with st.expander('Run-driven Spike Charts', expanded=False):
-                                    run_up, run_down = _split_and_sort(run_entries, 'runs', precision=0)
+                                    # heuristics to decide run vs ipu
+                                    delta_runs = entry.get('delta_runs', None)
 
-                                    if run_up:
-                                        with st.expander('Going Up', expanded=False):
-                                            for i in range(0, len(run_up), 3):
-                                                row = run_up[i:i+3]
-                                                cols = st.columns(3)
-                                                for col_idx, rec in enumerate(row):
-                                                    with cols[col_idx]:
-                                                        org_n = rec['org']
-                                                        project_n = rec['project_name']
-                                                        task_name = rec['task_name']
-                                                        daily = rec['daily']
-                                                        series = daily['runs']
-                                                        chart_title = f"{task_name} — {org_n} / {project_n} (Runs)"
-                                                        st.markdown(f"**{chart_title}**")
-                                                        spike_val = rec.get('spike_val', 0)
-                                                        st.metric('Spike', _arrow_change(spike_val, precision=0), delta='(compared to last week)')
-                                                        st.line_chart(series, width='stretch', height=260)
+                                    mean_ipu = daily['total_ipus'].mean() if 'total_ipus' in daily.columns else 0.0
+                                    peak_ipu = daily['total_ipus'].max() if 'total_ipus' in daily.columns else 0.0
+                                    mult_ipu = (peak_ipu / mean_ipu) if mean_ipu > 0 else (peak_ipu if peak_ipu > 0 else 0.0)
 
-                                    if run_down:
-                                        with st.expander('Going Down', expanded=False):
-                                            for i in range(0, len(run_down), 3):
-                                                row = run_down[i:i+3]
-                                                cols = st.columns(3)
-                                                for col_idx, rec in enumerate(row):
-                                                    with cols[col_idx]:
-                                                        org_n = rec['org']
-                                                        project_n = rec['project_name']
-                                                        task_name = rec['task_name']
-                                                        daily = rec['daily']
-                                                        series = daily['runs']
-                                                        chart_title = f"{task_name} — {org_n} / {project_n} (Runs)"
-                                                        st.markdown(f"**{chart_title}**")
-                                                        spike_val = rec.get('spike_val', 0)
-                                                        st.metric('Spike', _arrow_change(spike_val, precision=0), delta='(compared to last week)')
-                                                        st.line_chart(series, width='stretch', height=260)
+                                    mean_runs = daily['runs'].mean() if 'runs' in daily.columns else 0.0
+                                    peak_runs = daily['runs'].max() if 'runs' in daily.columns else 0.0
+                                    mult_runs = (peak_runs / mean_runs) if mean_runs > 0 else (peak_runs if peak_runs > 0 else 0.0)
 
-                except Exception:
-                    st.warning('Unable to render spike charts')
+                                    choose_runs = False
+                                    if delta_runs is not None and abs(delta_runs) > 50:
+                                        choose_runs = True
+                                    elif mult_runs > mult_ipu:
+                                        choose_runs = True
 
-            # Daily Trends now is tab2
-            with tab2:
+                                    record = {
+                                        'org': org_n,
+                                        'project_name': project_n,
+                                        'task_name': task_name,
+                                        'daily': daily,
+                                        'choose_runs': choose_runs,
+                                        'delta_ipus': entry.get('delta_ipus', None),
+                                        'delta_runs': entry.get('delta_runs', None),
+                                    }
+
+                                    if choose_runs:
+                                        run_entries.append(record)
+                                    else:
+                                        ipu_entries.append(record)
+
+                                def _split_and_sort(entries, metric_key, precision=2):
+                                    up = []
+                                    down = []
+                                    for rec in entries:
+                                        # Prefer explicit delta from task_flags if available
+                                        spike_val = None
+                                        if metric_key == 'total_ipus' and rec.get('delta_ipus') is not None:
+                                            spike_val = float(rec.get('delta_ipus'))
+                                        if metric_key == 'runs' and rec.get('delta_runs') is not None:
+                                            spike_val = float(rec.get('delta_runs'))
+
+                                        daily = rec['daily']
+                                        series = daily[metric_key]
+                                        if spike_val is None:
+                                            peak_val = series.max()
+                                            mean_val = series.mean()
+                                            spike_val = peak_val - mean_val
+                                        rec['spike_val'] = spike_val
+                                        # classify by spike sign
+                                        if spike_val >= 0:
+                                            up.append(rec)
+                                        else:
+                                            down.append(rec)
+                                    # sort by absolute spike magnitude desc
+                                    up = sorted(up, key=lambda r: abs(r.get('spike_val', 0)), reverse=True)
+                                    down = sorted(down, key=lambda r: abs(r.get('spike_val', 0)), reverse=True)
+                                    return up, down
+
+                                # Render IPU-driven spikes first, split into Going Up / Going Down (collapsible)
+                                if ipu_entries:
+                                    with st.expander('IPU-driven Spike Charts', expanded=False):
+                                        ipu_up, ipu_down = _split_and_sort(ipu_entries, 'total_ipus', precision=2)
+
+                                        if ipu_up:
+                                            with st.expander('Going Up', expanded=False):
+                                                for i in range(0, len(ipu_up), 3):
+                                                    row = ipu_up[i:i+3]
+                                                    cols = st.columns(3)
+                                                    for col_idx, rec in enumerate(row):
+                                                        with cols[col_idx]:
+                                                            org_n = rec['org']
+                                                            project_n = rec['project_name']
+                                                            task_name = rec['task_name']
+                                                            daily = rec['daily']
+                                                            series = daily['total_ipus']
+                                                            chart_title = f"{task_name} — {org_n} / {project_n} (IPUs)"
+                                                            st.markdown(f"**{chart_title}**")
+                                                            spike_val = rec.get('spike_val', 0)
+                                                            st.metric('Spike', _arrow_change(spike_val, precision=2), delta='(compared to last week)')
+                                                            st.line_chart(series, width='stretch', height=260)
+
+                                        if ipu_down:
+                                            with st.expander('Going Down', expanded=False):
+                                                for i in range(0, len(ipu_down), 3):
+                                                    row = ipu_down[i:i+3]
+                                                    cols = st.columns(3)
+                                                    for col_idx, rec in enumerate(row):
+                                                        with cols[col_idx]:
+                                                            org_n = rec['org']
+                                                            project_n = rec['project_name']
+                                                            task_name = rec['task_name']
+                                                            daily = rec['daily']
+                                                            series = daily['total_ipus']
+                                                            chart_title = f"{task_name} — {org_n} / {project_n} (IPUs)"
+                                                            st.markdown(f"**{chart_title}**")
+                                                            spike_val = rec.get('spike_val', 0)
+                                                            st.metric('Spike', _arrow_change(spike_val, precision=2), delta='(compared to last week)')
+                                                            st.line_chart(series, width='stretch', height=260)
+
+                                # Then render Run-driven spikes, split into Going Up / Going Down
+                                if run_entries:
+                                    with st.expander('Run-driven Spike Charts', expanded=False):
+                                        run_up, run_down = _split_and_sort(run_entries, 'runs', precision=0)
+
+                                        if run_up:
+                                            with st.expander('Going Up', expanded=False):
+                                                for i in range(0, len(run_up), 3):
+                                                    row = run_up[i:i+3]
+                                                    cols = st.columns(3)
+                                                    for col_idx, rec in enumerate(row):
+                                                        with cols[col_idx]:
+                                                            org_n = rec['org']
+                                                            project_n = rec['project_name']
+                                                            task_name = rec['task_name']
+                                                            daily = rec['daily']
+                                                            series = daily['runs']
+                                                            chart_title = f"{task_name} — {org_n} / {project_n} (Runs)"
+                                                            st.markdown(f"**{chart_title}**")
+                                                            spike_val = rec.get('spike_val', 0)
+                                                            st.metric('Spike', _arrow_change(spike_val, precision=0), delta='(compared to last week)')
+                                                            st.line_chart(series, width='stretch', height=260)
+
+                                        if run_down:
+                                            with st.expander('Going Down', expanded=False):
+                                                for i in range(0, len(run_down), 3):
+                                                    row = run_down[i:i+3]
+                                                    cols = st.columns(3)
+                                                    for col_idx, rec in enumerate(row):
+                                                        with cols[col_idx]:
+                                                            org_n = rec['org']
+                                                            project_n = rec['project_name']
+                                                            task_name = rec['task_name']
+                                                            daily = rec['daily']
+                                                            series = daily['runs']
+                                                            chart_title = f"{task_name} — {org_n} / {project_n} (Runs)"
+                                                            st.markdown(f"**{chart_title}**")
+                                                            spike_val = rec.get('spike_val', 0)
+                                                            st.metric('Spike', _arrow_change(spike_val, precision=0), delta='(compared to last week)')
+                                                            st.line_chart(series, width='stretch', height=260)
+
+                    except Exception:
+                        st.warning('Unable to render spike charts')
+
+                # Daily Trends
+            elif analysis_section == "Daily Trends":
                 st.write("Shows how your task usage varies day by day")
                 
                 daily_stats = get_daily_stats_by_date_range(
@@ -2435,36 +2588,55 @@ def display_historical_analysis():
                     st.dataframe(task_table.reset_index(drop=True), width='stretch', hide_index=True)
 
                 st.divider()
+                st.subheader("Daily Usage by Log Type")
+                st.write("Task Usage vs Mass Ingestion over time (IPUs and task counts).")
+
+                log_daily = _reports.get_log_type_daily_stats_by_date_range(
+                    start_date.isoformat(), analysis_end.isoformat(), log_type=log_type
+                )
+                if log_daily.empty:
+                    st.info("No log-type daily data for this date range")
+                else:
+                    log_daily = log_daily.copy()
+                    log_daily['date'] = pd.to_datetime(log_daily['date'], errors='coerce')
+                    log_daily = log_daily.dropna(subset=['date']).sort_values(['date', 'log_type'])
+
+                    ipu_by_type = log_daily.pivot_table(
+                        index='date', columns='log_type', values='total_ipus', aggfunc='sum'
+                    ).sort_index().fillna(0)
+                    tasks_by_type = log_daily.pivot_table(
+                        index='date', columns='log_type', values='task_count', aggfunc='sum'
+                    ).sort_index().fillna(0)
+
+                    log_col1, log_col2 = st.columns(2)
+                    with log_col1:
+                        st.caption("Daily IPUs by log type")
+                        st.line_chart(ipu_by_type, width='stretch')
+                    with log_col2:
+                        st.caption("Daily task counts by log type")
+                        st.line_chart(tasks_by_type, width='stretch')
+                    st.dataframe(log_daily, width='stretch', hide_index=True)
+
+                st.divider()
                 st.subheader("Daily Usage Trends by Organization")
                 st.write("See how each organization changes over time using task end dates.")
 
-                org_daily_raw = get_tasks_by_date_range(
+                org_daily_summary = get_org_daily_stats_by_date_range(
                     start_date.isoformat(), analysis_end.isoformat()
                 )
 
-                if org_daily_raw.empty:
+                if org_daily_summary.empty:
                     st.info("No organization data for this date range")
                 else:
-                    org_daily = _effective_metrics(org_daily_raw)
-                    if 'end_time' in org_daily.columns:
-                        org_daily['date'] = pd.to_datetime(org_daily['end_time'], errors='coerce', dayfirst=True).dt.date
-                    elif 'start_time' in org_daily.columns:
-                        org_daily['date'] = pd.to_datetime(org_daily['start_time'], errors='coerce', dayfirst=True).dt.date
-                    else:
-                        org_daily['date'] = pd.NaT
+                    org_daily_summary = org_daily_summary.copy()
+                    org_daily_summary['date'] = pd.to_datetime(
+                        org_daily_summary['date'], errors='coerce', format='mixed'
+                    ).dt.date
+                    org_daily_summary = org_daily_summary.dropna(subset=['date']).sort_values(['date', 'org'])
 
-                    org_daily = org_daily.dropna(subset=['date'])
-
-                    if org_daily.empty:
-                        st.info("No valid timestamps available for organization trends")
-                    else:
-                        org_daily_summary = org_daily.groupby(['date', 'org']).agg(
-                            task_count=('task_name', 'count'),
-                            total_ipus=('effective_ipus', 'sum'),
-                            total_cost=('effective_cost', 'sum'),
-                        ).reset_index().sort_values(['date', 'org'])
-
-                    available_orgs = sorted([x for x in org_daily_summary['org'].dropna().unique() if str(x).strip()])
+                    available_orgs = sorted([
+                        x for x in org_daily_summary['org'].dropna().unique() if str(x).strip()
+                    ])
                     selected_orgs = st.multiselect(
                         "Organizations to display",
                         options=available_orgs,
@@ -2499,9 +2671,9 @@ def display_historical_analysis():
                         st.caption("Charts shown: Task Count by Org, Total IPUs by Org, Total Cost by Org")
                         st.dataframe(org_daily_summary, width='stretch', hide_index=True)
 
-                    st.divider()
-                    st.subheader("Export Logs by Timestamp")
-                    st.caption("Choose an exact start/end timestamp and export matching log rows.")
+                st.divider()
+                st.subheader("Export Logs by Timestamp")
+                st.caption("Choose an exact start/end timestamp and export matching log rows.")
 
                 export_col1, export_col2 = st.columns(2)
                 with export_col1:
@@ -2573,7 +2745,7 @@ def display_historical_analysis():
                                 width="stretch",
                             )
         
-            with tab3:
+            elif analysis_section == "By Organization":
                 st.subheader("Breakdown by Organization")
                 st.write("See which organizations are using the most resources")
                 
@@ -2631,7 +2803,7 @@ def display_historical_analysis():
 
                     st.dataframe(log_type_stats, width='stretch', hide_index=True)
         
-            with tab4:
+            elif analysis_section == "By Project":
                 st.subheader("Breakdown by Project")
                 st.write("See which projects are using the most resources")
                 
@@ -2650,7 +2822,7 @@ def display_historical_analysis():
                     
                     st.dataframe(project_stats, width='stretch', hide_index=True)
 
-            with tab5:
+            elif analysis_section == "Anomaly Detection":
                 st.subheader("Anomaly Detection")
                 st.write("Identify unusual days that deviate from normal patterns")
                 
@@ -2694,7 +2866,7 @@ def display_historical_analysis():
                         start_date.isoformat(), analysis_end.isoformat(), org=org_param
                     )
                     if not daily_stats.empty:
-                        daily_stats['date'] = pd.to_datetime(daily_stats['date'], errors='coerce', dayfirst=True)
+                        daily_stats['date'] = pd.to_datetime(daily_stats['date'], errors='coerce', format='mixed', dayfirst=True)
                         daily_stats = daily_stats.dropna(subset=['date']).sort_values('date')
                         st.line_chart(daily_stats.set_index('date')[[metric]], width='stretch')
 
@@ -2750,9 +2922,9 @@ def display_historical_analysis():
                         else:
                             raw_task_rows = _effective_metrics(raw_task_rows)
                             if 'end_time' in raw_task_rows.columns:
-                                raw_task_rows['task_date'] = pd.to_datetime(raw_task_rows['end_time'], errors='coerce', dayfirst=True).dt.date
+                                raw_task_rows['task_date'] = pd.to_datetime(raw_task_rows['end_time'], errors='coerce', format='mixed', dayfirst=True).dt.date
                             elif 'start_time' in raw_task_rows.columns:
-                                raw_task_rows['task_date'] = pd.to_datetime(raw_task_rows['start_time'], errors='coerce', dayfirst=True).dt.date
+                                raw_task_rows['task_date'] = pd.to_datetime(raw_task_rows['start_time'], errors='coerce', format='mixed', dayfirst=True).dt.date
                             else:
                                 raw_task_rows['task_date'] = pd.NaT
 
@@ -2938,24 +3110,51 @@ def main():
         display_file_upload()
         
         if st.session_state.processing_complete:
-            if 'merged_df_path' in st.session_state:
-                full_df = pd.read_pickle(st.session_state.merged_df_path)
-            elif 'merged_preview' in st.session_state:
-                full_df = st.session_state.merged_preview
+            total_rows = int(st.session_state.get('merged_df_rows') or 0)
+            preview_df = st.session_state.get('merged_preview')
+            pickle_path = st.session_state.get('merged_df_path')
+
+            # Avoid reloading ~1M-row pickles on every refresh; save_run loads full data itself.
+            load_full = st.checkbox(
+                "Load full dataset for on-page analysis",
+                value=bool(st.session_state.get('run_full_current_analysis', False)),
+                key="run_full_current_analysis",
+                help="Leave unchecked for a fast preview. Append to Historical Table always uses the full upload.",
+            )
+
+            if load_full and pickle_path:
+                with st.spinner(f"Loading full dataset ({total_rows:,} rows)..."):
+                    full_df = pd.read_pickle(pickle_path)
+            elif preview_df is not None:
+                full_df = preview_df
+                if total_rows > len(preview_df):
+                    st.info(
+                        f"Showing a preview of {len(preview_df):,} / {total_rows:,} rows for speed. "
+                        "Enable “Load full dataset for on-page analysis” for complete charts, "
+                        "or use Append to Historical Table (always full data)."
+                    )
+            elif pickle_path:
+                full_df = pd.read_pickle(pickle_path)
             else:
                 full_df = st.session_state.merged_df
 
             # Keep derived metrics aligned with current sidebar factors.
             if full_df is not None and not full_df.empty and 'Metered Value' in full_df.columns:
                 full_df = full_df.copy()
-                full_df['IPUs'] = calculate_ipus(full_df['Metered Value'])
+                if 'Log Type' in full_df.columns:
+                    full_df['IPUs'] = calculate_ipus_by_log_type(
+                        full_df['Metered Value'], full_df['Log Type']
+                    )
+                else:
+                    full_df['IPUs'] = calculate_ipus(full_df['Metered Value'])
                 full_df['Cost/IPU/Month'] = calculate_cost_per_ipu_month(full_df['IPUs'])
 
             st.session_state.source_files = st.session_state.get('uploaded_files', [])
 
-            filtered_df = display_global_filters(full_df)
-
+            # Save section uses the pickle path and does not need the preview frame.
             display_save_run_section(full_df)
+
+            filtered_df = display_global_filters(full_df)
 
             st.divider()
             
@@ -2980,7 +3179,6 @@ def main():
             st.divider()
 
             display_export_options(filtered_df)
-
     
     elif view == "Historical Analysis":
         display_historical_analysis()

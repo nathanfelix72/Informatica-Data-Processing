@@ -18,6 +18,45 @@ ORG_MAPPING = {
     # Add more mappings as needed
 }
 
+# Canonical base orgs shown in the upload UI (Task Usage).
+BASE_ORGS = [
+    "BYU-Dev",
+    "BYU-Int",
+    "BYU-Prod",
+    "BYU-Campus-Int",
+    "BYU-Campus-Prod",
+    "CES-Prod",
+    "CES-Sandbox",
+]
+
+# Mass Ingestion is tracked as its own org (same base name, distinct series).
+MASS_INGESTION_ORG_SUFFIX = " Mass Ingestion"
+
+
+def mass_ingestion_org_name(org_name):
+    """Return the Mass Ingestion org label for a base org name."""
+    base = str(org_name).strip() if org_name is not None else ""
+    if not base:
+        base = "Unknown"
+    if base.endswith(MASS_INGESTION_ORG_SUFFIX):
+        return base
+    return f"{base}{MASS_INGESTION_ORG_SUFFIX}"
+
+
+def is_mass_ingestion_org(org_name):
+    """True when the org label is already a Mass Ingestion org."""
+    text = str(org_name).strip() if org_name is not None else ""
+    return text.endswith(MASS_INGESTION_ORG_SUFFIX)
+
+
+def get_all_org_options():
+    """Base orgs plus Mass Ingestion counterparts for upload / filters."""
+    options = []
+    for org in BASE_ORGS:
+        options.append(org)
+        options.append(mass_ingestion_org_name(org))
+    return options
+
 
 def get_org_name(org_id):
     """

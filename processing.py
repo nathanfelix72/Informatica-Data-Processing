@@ -10,8 +10,8 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from pathlib import Path
-from calculations import calculate_ipus, calculate_cost_per_ipu_month
-from mappings import get_org_name
+from calculations import calculate_ipus, calculate_ipus_by_log_type, calculate_cost_per_ipu_month
+from mappings import get_org_name, mass_ingestion_org_name, is_mass_ingestion_org, MASS_INGESTION_ORG_SUFFIX
 
 
 def _to_datetime_mixed(values):
@@ -113,7 +113,11 @@ def normalize_column_names(df):
         'meteredvalue': 'Metered Value',
         'metered value': 'Metered Value',
         'volume (gbs)': 'Metered Value',
+        'utilization(bytes)': 'Utilization (Bytes)',
+        'utilization (bytes)': 'Utilization (Bytes)',
         'metering date (utc)': 'Metering Date (UTC)',
+        'date': 'Date',
+        'runtime environment': 'Environment',
         'audittime': 'Audit Time',
         'audit time': 'Audit Time',
         'obmtasktime(s)': 'OBM Task Time(s)',
@@ -171,8 +175,14 @@ def detect_log_type(columns, filename=None):
         'folder name', 'project name', 'audit time',
     }
 
-    has_raw_mi = mi_markers.issubset(lower_cols) or (
-        'volume (gbs)' in lower_cols and 'agent name' in lower_cols
+    has_utilization = (
+        'utilization(bytes)' in lower_cols or 'utilization (bytes)' in lower_cols
+    )
+    has_raw_mi = (
+        mi_markers.issubset(lower_cols)
+        or ('volume (gbs)' in lower_cols and 'agent name' in lower_cols)
+        or ('job name' in lower_cols and 'volume (gbs)' in lower_cols)
+        or (has_utilization and 'date' in lower_cols)
     )
     has_task_shape = bool(lower_cols & task_markers) or (
         'task id' in lower_cols and 'metered value' in lower_cols and 'job name' not in lower_cols
@@ -222,12 +232,42 @@ def normalize_mass_ingestion_df(df):
     """Fill gaps so mass-ingestion rows match the standard task schema."""
     original_missing_end = None
 
+    # Older MI exports use Date + Utilization(Bytes) instead of job timestamps/volume.
+    if 'Date' in df.columns:
+        if 'End Time' not in df.columns:
+            df['End Time'] = pd.NA
+        missing_end = _is_missing_value(df['End Time'])
+        date_available = ~_is_missing_value(df['Date'])
+        fill_mask = missing_end & date_available
+        if fill_mask.any():
+            dates = _to_datetime_mixed(df.loc[fill_mask, 'Date'])
+            df.loc[fill_mask, 'End Time'] = dates.dt.strftime('%Y-%m-%d') + ' 23:59:59'
+            if 'Start Time' not in df.columns:
+                df['Start Time'] = pd.NA
+            missing_start = _is_missing_value(df['Start Time'])
+            start_fill = fill_mask & missing_start
+            if start_fill.any():
+                df.loc[start_fill, 'Start Time'] = dates.loc[start_fill].dt.strftime('%Y-%m-%d') + ' 00:00:00'
+
+    if 'Utilization (Bytes)' in df.columns:
+        bytes_vals = pd.to_numeric(df['Utilization (Bytes)'], errors='coerce')
+        volume_gb = bytes_vals / (1024 ** 3)
+        if 'Metered Value' not in df.columns:
+            df['Metered Value'] = volume_gb
+        else:
+            missing_metered = _is_missing_value(df['Metered Value']) | (
+                pd.to_numeric(df['Metered Value'], errors='coerce').fillna(0) == 0
+            )
+            df.loc[missing_metered, 'Metered Value'] = volume_gb.loc[missing_metered]
+
     if 'Task Run ID' in df.columns:
         if 'Task ID' not in df.columns:
             df['Task ID'] = df['Task Run ID']
         else:
             missing_task_id = _is_missing_value(df['Task ID'])
             df.loc[missing_task_id, 'Task ID'] = df.loc[missing_task_id, 'Task Run ID']
+    elif 'Task ID' in df.columns and 'Task Run ID' not in df.columns:
+        df['Task Run ID'] = df['Task ID']
 
     if 'Task Name' in df.columns:
         if 'Task Type' not in df.columns:
@@ -243,9 +283,7 @@ def normalize_mass_ingestion_df(df):
         metering_available = ~_is_missing_value(df['Metering Date (UTC)'])
         fill_mask = missing_end & metering_available
         if fill_mask.any():
-            metering_dates = pd.to_datetime(
-                df.loc[fill_mask, 'Metering Date (UTC)'], errors='coerce', dayfirst=True
-            )
+            metering_dates = _to_datetime_mixed(df.loc[fill_mask, 'Metering Date (UTC)'])
             df.loc[fill_mask, 'End Time'] = metering_dates.dt.strftime('%Y-%m-%d') + ' 23:59:59'
 
     if 'Status' not in df.columns:
@@ -304,7 +342,7 @@ def read_csv_file(file_path):
         DataFrame with data from CSV file
     """
     try:
-        df = pd.read_csv(file_path)
+        df = pd.read_csv(file_path, low_memory=False)
         
         # Remove completely empty rows
         df = df.dropna(how='all')
@@ -428,7 +466,8 @@ def add_ipu_column(df):
     """
     Add IPUs column calculated from Metered Value.
     
-    Uses vectorized calculation for performance.
+    Uses vectorized calculation for performance. Mass Ingestion rows use
+    a different conversion factor (0.1) than Task Usage (0.16).
     
     Args:
         df: DataFrame that should have 'Metered Value' column
@@ -439,8 +478,11 @@ def add_ipu_column(df):
     if 'Metered Value' not in df.columns:
         df['IPUs'] = 0.0
         return df
-    
-    df['IPUs'] = calculate_ipus(df['Metered Value'])
+
+    if 'Log Type' in df.columns:
+        df['IPUs'] = calculate_ipus_by_log_type(df['Metered Value'], df['Log Type'])
+    else:
+        df['IPUs'] = calculate_ipus(df['Metered Value'])
     
     return df
 
@@ -521,8 +563,13 @@ def process_and_merge_files(uploaded_files, org_assignments=None, log_type_assig
 
             df['Log Type'] = log_type
             
-            # Assign org for this file
+            # Assign org for this file. Mass Ingestion is always a distinct org
+            # (e.g. "BYU-Dev Mass Ingestion") so it never combines with Task Usage.
             org = org_assignments.get(uploaded_file.name, 'Unknown')
+            if log_type == LOG_TYPE_MASS_INGESTION and not is_mass_ingestion_org(org):
+                org = mass_ingestion_org_name(org)
+            elif log_type == LOG_TYPE_TASK_USAGE and is_mass_ingestion_org(org):
+                org = org[: -len(MASS_INGESTION_ORG_SUFFIX)].strip() or org
             df['Org'] = org
             
             # Keep only standard columns that exist in this file
