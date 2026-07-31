@@ -24,6 +24,10 @@ from processing import (
     get_duplicate_task_run_ids,
     get_failed_task_counts,
     get_summary_by_group,
+    peek_log_type,
+    LOG_TYPES,
+    LOG_TYPE_MASS_INGESTION,
+    LOG_TYPE_TASK_USAGE,
 )
 from calculations import (
     calculate_cost_per_ipu_month,
@@ -44,6 +48,7 @@ from reports import (
     get_project_stats_by_date_range,
     get_environment_stats_by_date_range,
     get_agent_stats_by_date_range,
+    get_log_type_stats_by_date_range,
     get_task_type_stats_by_date_range,
     get_status_stats_by_date_range,
     detect_anomalies_in_date_range,
@@ -151,9 +156,13 @@ def display_file_upload():
         accept_multiple_files=True,
         help="Drag and drop multiple files or click to select"
     )
-    st.caption("Mass-ingestion CSVs with Job Name, Task Name, Agent Name, and Volume columns are normalized automatically.")
+    st.caption(
+        "Supports Task Usage exports and Mass Ingestion logs. "
+        "Log type is detected from columns and filename (e.g. byudevmi.csv) and can be overridden per file."
+    )
     
     org_assignments = {}
+    log_type_assignments = {}
 
     def infer_org_from_filename(filename, org_options, used_orgs):
         """Guess the organization from the uploaded filename."""
@@ -189,32 +198,49 @@ def display_file_upload():
     if uploaded_files:
         st.info(f"{len(uploaded_files)} file(s) selected")
         
-        # Show org selection for each file
-        st.subheader("Select Organization for Each File")
+        # Show org + log type selection for each file
+        st.subheader("Select Organization and Log Type for Each File")
         
         org_options = ["BYU-Dev", "BYU-Int", "BYU-Prod", "BYU-Campus-Int", "BYU-Campus-Prod", "CES-Prod", "CES-Sandbox"]
         used_orgs = set()
         
         for uploaded_file in uploaded_files:
-            col1, col2 = st.columns([3, 1])
+            col1, col2, col3 = st.columns([3, 1, 1])
             suggested_org = infer_org_from_filename(uploaded_file.name, org_options, used_orgs)
+            detected_log_type = peek_log_type(uploaded_file)
             with col1:
                 st.write(f"**{uploaded_file.name}**")
+                if detected_log_type == LOG_TYPE_MASS_INGESTION:
+                    st.caption("Detected: Mass Ingestion")
+                else:
+                    st.caption("Detected: Task Usage")
             with col2:
                 default_index = org_options.index(suggested_org) if suggested_org in org_options else 0
                 org = st.selectbox(
                     "Org",
                     org_options,
                     index=default_index,
-                    key=uploaded_file.name,
+                    key=f"org_{uploaded_file.name}",
                     label_visibility="collapsed"
                 )
                 org_assignments[uploaded_file.name] = org
                 used_orgs.add(org)
+            with col3:
+                log_default = LOG_TYPES.index(detected_log_type) if detected_log_type in LOG_TYPES else 0
+                log_type = st.selectbox(
+                    "Log Type",
+                    LOG_TYPES,
+                    index=log_default,
+                    key=f"logtype_{uploaded_file.name}",
+                    label_visibility="collapsed",
+                )
+                log_type_assignments[uploaded_file.name] = log_type
         
         if st.button("Process Files", width="stretch"):
             with st.spinner("Processing files..."):
-                merged_df, errors = process_and_merge_files(uploaded_files, org_assignments)
+                merged_df, errors = process_and_merge_files(
+                    uploaded_files, org_assignments, log_type_assignments
+                )
                 
                 # Persist merged_df to disk to avoid storing a huge DataFrame in session_state
                 import os, time
@@ -237,7 +263,15 @@ def display_file_upload():
                             st.error(error)
                 
                 if not merged_df.empty:
-                    st.success(f"Successfully processed! {len(merged_df):,} total rows")
+                    type_counts = (
+                        merged_df['Log Type'].value_counts().to_dict()
+                        if 'Log Type' in merged_df.columns else {}
+                    )
+                    type_note = ", ".join(f"{k}: {v:,}" for k, v in type_counts.items())
+                    st.success(
+                        f"Successfully processed! {len(merged_df):,} total rows"
+                        + (f" ({type_note})" if type_note else "")
+                    )
     
     return uploaded_files
 
@@ -271,6 +305,17 @@ def display_global_filters(df):
                     key="global_org_filter"
                 )
                 filters['Org'] = selected_orgs
+
+        if 'Log Type' in df.columns:
+            with filter_cols[0]:
+                all_log_types = build_filter_options(df['Log Type'])
+                selected_log_types = st.multiselect(
+                    "Log Types",
+                    all_log_types,
+                    default=all_log_types,
+                    key="global_logtype_filter"
+                )
+                filters['Log Type'] = selected_log_types
 
         if 'Project Name' in df.columns:
             with filter_cols[0]:
@@ -319,6 +364,7 @@ def display_global_filters(df):
         if st.button("Clear Filters", key="clear_global_filters", width="stretch"):
             for key in [
                 "global_org_filter",
+                "global_logtype_filter",
                 "global_project_filter",
                 "global_folder_filter",
                 "global_tasktype_filter",
@@ -800,7 +846,10 @@ def display_summaries(df):
     df_filtered = df.copy()
     
     # Tabs for different summary views
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["By Org", "By Environment", "By Project", "By Project/Folder", "By Task Type", "By Agent"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "By Org", "By Environment", "By Project", "By Project/Folder",
+        "By Task Type", "By Agent", "By Log Type",
+    ])
     
     with tab1:
         if 'Org' in df_filtered.columns:
@@ -852,6 +901,13 @@ def display_summaries(df):
             st.dataframe(summary, width="stretch")
         else:
             st.info("Agent Name column not available")
+
+    with tab7:
+        if 'Log Type' in df_filtered.columns:
+            summary = get_summary_by_group(df_filtered, 'Log Type')
+            st.dataframe(summary, width="stretch")
+        else:
+            st.info("Log Type column not available")
 
 
 def display_export_options(df):
@@ -946,6 +1002,10 @@ def display_export_options(df):
             # By Agent
             if 'Agent Name' in df.columns:
                 get_summary_by_group(df, 'Agent Name').to_excel(writer, sheet_name='By Agent')
+
+            # By Log Type
+            if 'Log Type' in df.columns:
+                get_summary_by_group(df, 'Log Type').to_excel(writer, sheet_name='By Log Type')
         
         summary_buffer.seek(0)
         
@@ -1047,28 +1107,11 @@ def display_historical_analysis():
         
         st.write(f"Data available from **{min_date}** to **{max_date}**")
 
-        missing_ranges = get_missing_task_date_ranges(min_date, max_date)
-        if missing_ranges:
-            range_labels = []
-            for range_start, range_end in missing_ranges[:5]:
-                if range_start == range_end:
-                    range_labels.append(str(range_start))
-                else:
-                    range_labels.append(f"{range_start} to {range_end}")
-
-            extra_count = len(missing_ranges) - len(range_labels)
-            suffix = f" and {extra_count} more gap(s)" if extra_count > 0 else ""
-            st.warning(
-                f"Missing data detected on {len(missing_ranges)} gap(s): {', '.join(range_labels)}{suffix}."
-            )
-        else:
-            st.success("No missing days detected across the full available date span.")
-
         default_start_date = max(min_date, (max_date - timedelta(days=30)))
         default_end_date = max_date
 
         # Date range selector
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             start_date = st.date_input(
                 "Start Date",
@@ -1085,6 +1128,49 @@ def display_historical_analysis():
                 max_value=max_date,
                 key="historical_end_date"
             )
+        with col3:
+            log_type_choice = st.selectbox(
+                "Log Type",
+                options=["All", LOG_TYPE_TASK_USAGE, LOG_TYPE_MASS_INGESTION],
+                index=0,
+                key="historical_log_type",
+                help="Filter analysis to Task Usage exports, Mass Ingestion logs, or both.",
+            )
+            log_type = None if log_type_choice == "All" else log_type_choice
+
+        # Apply log-type filter to every historical query in this view
+        from functools import partial
+        get_tasks_by_date_range = partial(get_tasks_by_date_range, log_type=log_type)
+        get_daily_stats_by_date_range = partial(get_daily_stats_by_date_range, log_type=log_type)
+        get_org_stats_by_date_range = partial(get_org_stats_by_date_range, log_type=log_type)
+        get_project_stats_by_date_range = partial(get_project_stats_by_date_range, log_type=log_type)
+        get_environment_stats_by_date_range = partial(get_environment_stats_by_date_range, log_type=log_type)
+        get_agent_stats_by_date_range = partial(get_agent_stats_by_date_range, log_type=log_type)
+        get_task_type_stats_by_date_range = partial(get_task_type_stats_by_date_range, log_type=log_type)
+        get_status_stats_by_date_range = partial(get_status_stats_by_date_range, log_type=log_type)
+        detect_anomalies_in_date_range = partial(detect_anomalies_in_date_range, log_type=log_type)
+        get_task_spikes_for_period = partial(get_task_spikes_for_period, log_type=log_type)
+        count_tasks_by_date_range = partial(count_tasks_by_date_range, log_type=log_type)
+        delete_tasks_by_date_range = partial(delete_tasks_by_date_range, log_type=log_type)
+
+        missing_ranges = get_missing_task_date_ranges(min_date, max_date, log_type=log_type)
+        if missing_ranges:
+            range_labels = []
+            for range_start, range_end in missing_ranges[:5]:
+                if range_start == range_end:
+                    range_labels.append(str(range_start))
+                else:
+                    range_labels.append(f"{range_start} to {range_end}")
+
+            extra_count = len(missing_ranges) - len(range_labels)
+            suffix = f" and {extra_count} more gap(s)" if extra_count > 0 else ""
+            scope = f" ({log_type_choice})" if log_type else ""
+            st.warning(
+                f"Missing data detected{scope} on {len(missing_ranges)} gap(s): {', '.join(range_labels)}{suffix}."
+            )
+        else:
+            scope = f" for {log_type_choice}" if log_type else ""
+            st.success(f"No missing days detected{scope} across the full available date span.")
         
         if start_date > end_date:
             st.error("Start date must be before end date")
@@ -2466,6 +2552,26 @@ def display_historical_analysis():
                         st.bar_chart(agent_stats.set_index('agent_name')[['total_cost']], width='stretch')
 
                     st.dataframe(agent_stats, width='stretch', hide_index=True)
+
+                st.divider()
+                st.subheader("Breakdown by Log Type")
+                st.write("Compare Task Usage vs Mass Ingestion contribution in this date range")
+
+                # Log-type breakdown always shows both types (unfiltered) for context
+                log_type_stats = get_log_type_stats_by_date_range(
+                    start_date.isoformat(), analysis_end.isoformat()
+                )
+
+                if log_type_stats.empty:
+                    st.info("No log type data for this date range")
+                else:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.bar_chart(log_type_stats.set_index('log_type')[['total_ipus']], width='stretch')
+                    with col2:
+                        st.bar_chart(log_type_stats.set_index('log_type')[['total_cost']], width='stretch')
+
+                    st.dataframe(log_type_stats, width='stretch', hide_index=True)
         
             with tab4:
                 st.subheader("Breakdown by Project")
@@ -2714,7 +2820,7 @@ def display_historical_analysis():
                     if rows_to_delete.empty:
                         st.info("No rows match the selected date range.")
                     else:
-                        preview_columns = [col for col in ['end_time', 'agent_name', 'org', 'project_name', 'task_name', 'task_run_id', 'status'] if col in rows_to_delete.columns]
+                        preview_columns = [col for col in ['end_time', 'log_type', 'agent_name', 'org', 'project_name', 'task_name', 'task_run_id', 'status'] if col in rows_to_delete.columns]
                         st.dataframe(
                             rows_to_delete[preview_columns].head(500),
                             width='stretch',

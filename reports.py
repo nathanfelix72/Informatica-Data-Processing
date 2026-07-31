@@ -156,6 +156,7 @@ def init_database():
             org TEXT,
             environment TEXT,
             status TEXT,
+            log_type TEXT,
             start_time DATETIME,
             end_time DATETIME,
             ipus REAL,
@@ -189,6 +190,7 @@ def init_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_environment ON tasks(environment)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_task_type ON tasks(task_type)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_status ON tasks(status)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_log_type ON tasks(log_type)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_events_created_at ON history_events(created_at)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_events_action ON history_events(action)')
 
@@ -208,11 +210,31 @@ def init_database():
         except Exception:
             pass
 
+    if 'log_type' not in cols:
+        try:
+            cursor.execute('ALTER TABLE tasks ADD COLUMN log_type TEXT')
+        except Exception:
+            pass
+
     # Ensure unique index on row_hash to avoid inserting identical rows
     cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_row_hash ON tasks(row_hash)')
     
     conn.commit()
     conn.close()
+
+
+def _append_log_type_filter(query: str, params: list, log_type: str | None) -> tuple[str, list]:
+    """Append SQL for log_type. Legacy NULL/blank rows count as Task Usage."""
+    if not log_type:
+        return query, params
+
+    if log_type == 'Task Usage':
+        query += " AND (log_type = ? OR log_type IS NULL OR TRIM(COALESCE(log_type, '')) = '')"
+        params.append(log_type)
+    else:
+        query += ' AND log_type = ?'
+        params.append(log_type)
+    return query, params
 
 
 def record_history_event(action: str, start_date=None, end_date=None, affected_rows: int | None = None,
@@ -262,7 +284,7 @@ def get_history_events(action: str = None, limit: int | None = None) -> pd.DataF
 def count_tasks_by_date_range(start_date: str, end_date: str,
                               org: str = None, project: str = None,
                               environment: str = None, task_type: str = None,
-                              status: str = None) -> int:
+                              status: str = None, log_type: str = None) -> int:
     """Count task records filtered by date range and optional dimensions."""
     init_database()
     conn = sqlite3.connect(DB_PATH)
@@ -285,6 +307,7 @@ def count_tasks_by_date_range(start_date: str, end_date: str,
     if status:
         query += ' AND status = ?'
         params.append(status)
+    query, params = _append_log_type_filter(query, params, log_type)
 
     cursor = conn.cursor()
     cursor.execute(query, params)
@@ -396,8 +419,8 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
     # re-uploading the same task data does not create a new hash.
     hash_columns = [
         'Task ID', 'Task Run ID', 'Task Name', 'Task Type', 'Project Name',
-        'Folder Name', 'Org', 'Environment', 'Agent Name', 'Start Time', 'End Time',
-        'Metered Value',
+        'Folder Name', 'Org', 'Environment', 'Agent Name', 'Log Type',
+        'Start Time', 'End Time', 'Metered Value',
     ]
     available_columns = [col for col in hash_columns if col in merged_df.columns]
 
@@ -461,6 +484,7 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
         'Org': 'org',
         'Environment': 'environment',
         'Status': 'status',
+        'Log Type': 'log_type',
         'Start Time': 'start_time',
         'End Time': 'end_time',
         'IPUs': 'ipus',
@@ -475,7 +499,7 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
     insert_source_columns = [
         'Task ID', 'Task Name', 'Task Type', 'Task Run ID',
         'Agent Name', 'Project Name', 'Folder Name', 'Org', 'Environment', 'Status',
-        'Start Time', 'End Time', 'IPUs', 'Cost/IPU/Month', 'Metered Value', 'Cores Used'
+        'Log Type', 'Start Time', 'End Time', 'IPUs', 'Cost/IPU/Month', 'Metered Value', 'Cores Used'
     ]
     present_source_columns = [col for col in insert_source_columns if col in merged_df.columns]
 
@@ -510,7 +534,7 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
         col for col in [
             'task_id', 'task_name', 'task_type', 'task_run_id', 'row_hash',
             'agent_name', 'project_name', 'folder_name', 'org', 'environment', 'status',
-            'start_time', 'end_time', 'ipus', 'cost', 'metered_value', 'cores_used'
+            'log_type', 'start_time', 'end_time', 'ipus', 'cost', 'metered_value', 'cores_used'
         ] if col in staging_df.columns
     ]
 
@@ -590,7 +614,7 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
 def delete_tasks_by_date_range(start_date: str, end_date: str, org: str = None,
                                project: str = None, environment: str = None,
                                task_type: str = None, agent_name: str = None,
-                               status: str = None) -> tuple[int, int]:
+                               status: str = None, log_type: str = None) -> tuple[int, int]:
     """Delete historical task rows in a date range and return deleted and remaining counts."""
     init_database()
     conn = sqlite3.connect(DB_PATH)
@@ -617,6 +641,7 @@ def delete_tasks_by_date_range(start_date: str, end_date: str, org: str = None,
     if status:
         query += ' AND status = ?'
         params.append(status)
+    query, params = _append_log_type_filter(query, params, log_type)
 
     cursor.execute('SELECT COUNT(*) FROM tasks')
     before_count = cursor.fetchone()[0]
@@ -929,7 +954,7 @@ def get_task_date_range() -> tuple:
 
 def get_missing_task_date_ranges(start_date, end_date, org: str = None, project: str = None,
                                  environment: str = None, task_type: str = None,
-                                 status: str = None) -> list[tuple]:
+                                 status: str = None, log_type: str = None) -> list[tuple]:
     """Return consecutive date ranges with no task data inside the requested span."""
     start_dt = pd.to_datetime(start_date).date()
     end_dt = pd.to_datetime(end_date).date()
@@ -943,6 +968,7 @@ def get_missing_task_date_ranges(start_date, end_date, org: str = None, project:
         org=org,
         project=project,
         environment=environment,
+        log_type=log_type,
     )
 
     expected_dates = pd.date_range(start=start_dt, end=end_dt, freq='D').date
@@ -977,7 +1003,8 @@ def get_tasks_by_date_range(start_date: str, end_date: str,
                             org: str = None, project: str = None,
                             environment: str = None, task_type: str = None,
                             agent_name: str = None,
-                            status: str = None) -> pd.DataFrame:
+                            status: str = None,
+                            log_type: str = None) -> pd.DataFrame:
     """
     Get task records filtered by date range and optional dimensions.
     
@@ -990,6 +1017,7 @@ def get_tasks_by_date_range(start_date: str, end_date: str,
         task_type: Filter by task type (optional)
         agent_name: Filter by agent name (optional)
         status: Filter by status (optional)
+        log_type: Filter by log type (optional)
     
     Returns:
         DataFrame of task records
@@ -1018,6 +1046,7 @@ def get_tasks_by_date_range(start_date: str, end_date: str,
     if status:
         query += ' AND status = ?'
         params.append(status)
+    query, params = _append_log_type_filter(query, params, log_type)
     
     query += ' ORDER BY end_time'
     
@@ -1030,7 +1059,8 @@ def get_tasks_by_date_range(start_date: str, end_date: str,
 def get_daily_stats_by_date_range(start_date: str, end_date: str,
                                    org: str = None, project: str = None,
                                    environment: str = None,
-                                   agent_name: str = None) -> pd.DataFrame:
+                                   agent_name: str = None,
+                                   log_type: str = None) -> pd.DataFrame:
     """
     Get daily aggregated statistics for a date range.
     
@@ -1064,6 +1094,7 @@ def get_daily_stats_by_date_range(start_date: str, end_date: str,
     if agent_name:
         query += ' AND agent_name = ?'
         params.append(agent_name)
+    query, params = _append_log_type_filter(query, params, log_type)
 
     query += ' GROUP BY DATE(end_time) ORDER BY DATE(end_time)'
 
@@ -1072,7 +1103,8 @@ def get_daily_stats_by_date_range(start_date: str, end_date: str,
     return daily
 
 
-def get_org_stats_by_date_range(start_date: str, end_date: str) -> pd.DataFrame:
+def get_org_stats_by_date_range(start_date: str, end_date: str,
+                                log_type: str = None) -> pd.DataFrame:
     """Get statistics by organization for a date range."""
     init_database()
     conn = sqlite3.connect(DB_PATH)
@@ -1085,16 +1117,18 @@ def get_org_stats_by_date_range(start_date: str, end_date: str) -> pd.DataFrame:
         "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
         "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
         "COUNT(DISTINCT task_id) AS unique_tasks "
-        "FROM tasks WHERE end_time >= ? AND end_time <= ? "
-        "GROUP BY org ORDER BY total_ipus DESC"
+        "FROM tasks WHERE end_time >= ? AND end_time <= ?"
     )
     params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    query, params = _append_log_type_filter(query, params, log_type)
+    query += " GROUP BY org ORDER BY total_ipus DESC"
     org_stats = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return org_stats
 
 
-def get_project_stats_by_date_range(start_date: str, end_date: str) -> pd.DataFrame:
+def get_project_stats_by_date_range(start_date: str, end_date: str,
+                                    log_type: str = None) -> pd.DataFrame:
     """Get statistics by project for a date range."""
     init_database()
     conn = sqlite3.connect(DB_PATH)
@@ -1107,16 +1141,18 @@ def get_project_stats_by_date_range(start_date: str, end_date: str) -> pd.DataFr
         "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
         "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
         "COUNT(DISTINCT task_id) AS unique_tasks "
-        "FROM tasks WHERE end_time >= ? AND end_time <= ? "
-        "GROUP BY project_name ORDER BY total_ipus DESC"
+        "FROM tasks WHERE end_time >= ? AND end_time <= ?"
     )
     params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    query, params = _append_log_type_filter(query, params, log_type)
+    query += " GROUP BY project_name ORDER BY total_ipus DESC"
     project_stats = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return project_stats
 
 
-def get_environment_stats_by_date_range(start_date: str, end_date: str) -> pd.DataFrame:
+def get_environment_stats_by_date_range(start_date: str, end_date: str,
+                                        log_type: str = None) -> pd.DataFrame:
     """Get statistics by environment for a date range."""
     init_database()
     conn = sqlite3.connect(DB_PATH)
@@ -1129,16 +1165,18 @@ def get_environment_stats_by_date_range(start_date: str, end_date: str) -> pd.Da
         "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
         "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
         "COUNT(DISTINCT task_id) AS unique_tasks "
-        "FROM tasks WHERE end_time >= ? AND end_time <= ? "
-        "GROUP BY environment ORDER BY total_ipus DESC"
+        "FROM tasks WHERE end_time >= ? AND end_time <= ?"
     )
     params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    query, params = _append_log_type_filter(query, params, log_type)
+    query += " GROUP BY environment ORDER BY total_ipus DESC"
     env_stats = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return env_stats
 
 
-def get_agent_stats_by_date_range(start_date: str, end_date: str) -> pd.DataFrame:
+def get_agent_stats_by_date_range(start_date: str, end_date: str,
+                                  log_type: str = None) -> pd.DataFrame:
     """Get statistics by agent for a date range."""
     init_database()
     conn = sqlite3.connect(DB_PATH)
@@ -1151,16 +1189,42 @@ def get_agent_stats_by_date_range(start_date: str, end_date: str) -> pd.DataFram
         "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
         "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
         "COUNT(DISTINCT task_id) AS unique_tasks "
-        "FROM tasks WHERE end_time >= ? AND end_time <= ? "
-        "GROUP BY agent_name ORDER BY total_ipus DESC"
+        "FROM tasks WHERE end_time >= ? AND end_time <= ?"
     )
     params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    query, params = _append_log_type_filter(query, params, log_type)
+    query += " GROUP BY agent_name ORDER BY total_ipus DESC"
     agent_stats = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return agent_stats
 
 
-def get_task_type_stats_by_date_range(start_date: str, end_date: str) -> pd.DataFrame:
+def get_log_type_stats_by_date_range(start_date: str, end_date: str) -> pd.DataFrame:
+    """Get statistics by log type for a date range."""
+    init_database()
+    conn = sqlite3.connect(DB_PATH)
+
+    ipu_factor = float(calculations.IPU_CONVERSION_FACTOR)
+    cost_per_ipu = float(calculations.COST_PER_IPU_MONTH)
+
+    query = (
+        "SELECT COALESCE(NULLIF(TRIM(log_type), ''), 'Task Usage') AS log_type, "
+        "COUNT(*) AS task_count, "
+        "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
+        "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
+        "COUNT(DISTINCT task_id) AS unique_tasks "
+        "FROM tasks WHERE end_time >= ? AND end_time <= ? "
+        "GROUP BY COALESCE(NULLIF(TRIM(log_type), ''), 'Task Usage') "
+        "ORDER BY total_ipus DESC"
+    )
+    params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    log_type_stats = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return log_type_stats
+
+
+def get_task_type_stats_by_date_range(start_date: str, end_date: str,
+                                      log_type: str = None) -> pd.DataFrame:
     """Get statistics by task type for a date range."""
     init_database()
     conn = sqlite3.connect(DB_PATH)
@@ -1173,16 +1237,18 @@ def get_task_type_stats_by_date_range(start_date: str, end_date: str) -> pd.Data
         "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
         "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
         "COUNT(DISTINCT task_id) AS unique_tasks "
-        "FROM tasks WHERE end_time >= ? AND end_time <= ? "
-        "GROUP BY task_type ORDER BY total_ipus DESC"
+        "FROM tasks WHERE end_time >= ? AND end_time <= ?"
     )
     params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    query, params = _append_log_type_filter(query, params, log_type)
+    query += " GROUP BY task_type ORDER BY total_ipus DESC"
     tasktype_stats = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return tasktype_stats
 
 
-def get_status_stats_by_date_range(start_date: str, end_date: str) -> pd.DataFrame:
+def get_status_stats_by_date_range(start_date: str, end_date: str,
+                                   log_type: str = None) -> pd.DataFrame:
     """Get statistics by status for a date range."""
     init_database()
     conn = sqlite3.connect(DB_PATH)
@@ -1194,10 +1260,11 @@ def get_status_stats_by_date_range(start_date: str, end_date: str) -> pd.DataFra
         "SELECT status, COUNT(*) AS task_count, "
         "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
         "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost "
-        "FROM tasks WHERE end_time >= ? AND end_time <= ? "
-        "GROUP BY status ORDER BY total_ipus DESC"
+        "FROM tasks WHERE end_time >= ? AND end_time <= ?"
     )
     params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    query, params = _append_log_type_filter(query, params, log_type)
+    query += " GROUP BY status ORDER BY total_ipus DESC"
     status_stats = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return status_stats
@@ -1206,7 +1273,8 @@ def get_status_stats_by_date_range(start_date: str, end_date: str) -> pd.DataFra
 def detect_anomalies_in_date_range(start_date: str, end_date: str,
                                     metric: str = 'total_ipus',
                                     threshold_std: float = 2.0,
-                                    org: str = None) -> pd.DataFrame:
+                                    org: str = None,
+                                    log_type: str = None) -> pd.DataFrame:
     """
     Detect anomalies in daily metrics across a date range.
     
@@ -1216,11 +1284,12 @@ def detect_anomalies_in_date_range(start_date: str, end_date: str,
         metric: 'total_ipus', 'total_cost', or 'task_count'
         threshold_std: Standard deviations for anomaly threshold
         org: Optional org to filter by
+        log_type: Optional log type to filter by
     
     Returns:
         DataFrame with anomalous days
     """
-    daily_stats = get_daily_stats_by_date_range(start_date, end_date, org=org)
+    daily_stats = get_daily_stats_by_date_range(start_date, end_date, org=org, log_type=log_type)
     
     if daily_stats.empty or len(daily_stats) < 3:
         return pd.DataFrame()
@@ -1250,6 +1319,7 @@ def get_task_spikes_for_period(
     min_baseline_days: int = 5,
     top_n: int = 10,
     org: str = None,
+    log_type: str = None,
 ) -> pd.DataFrame:
     """Find task-level daily IPU spikes in the current window vs prior baseline.
 
@@ -1278,10 +1348,6 @@ def get_task_spikes_for_period(
         "WHERE end_time >= ? AND end_time <= ? "
         "AND task_name IS NOT NULL AND TRIM(task_name) <> '' "
     )
-    if org:
-        query += " AND org = ?"
-
-    query += " GROUP BY DATE(end_time), task_name, task_id, org, project_name"
     params = [
         ipu_factor,
         ipu_factor,
@@ -1290,7 +1356,11 @@ def get_task_spikes_for_period(
         f'{end_dt.isoformat()} 23:59:59',
     ]
     if org:
+        query += " AND org = ?"
         params.append(org)
+    query, params = _append_log_type_filter(query, params, log_type)
+
+    query += " GROUP BY DATE(end_time), task_name, task_id, org, project_name"
 
     all_daily = pd.read_sql_query(query, conn, params=params)
     conn.close()

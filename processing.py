@@ -9,12 +9,19 @@ with large datasets (500k+ rows).
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from pathlib import Path
 from calculations import calculate_ipus, calculate_cost_per_ipu_month
 from mappings import get_org_name
 
 
 def _to_datetime_mixed(values):
     return pd.to_datetime(values, errors='coerce', format='mixed', dayfirst=True)
+
+
+# Distinct logging sources that share the same historical pipeline
+LOG_TYPE_TASK_USAGE = 'Task Usage'
+LOG_TYPE_MASS_INGESTION = 'Mass Ingestion'
+LOG_TYPES = [LOG_TYPE_TASK_USAGE, LOG_TYPE_MASS_INGESTION]
 
 
 # Standard column names expected in output
@@ -38,6 +45,7 @@ STANDARD_COLUMNS = [
     'Audit Time',
     'OBM Task Time(s)',
     'Org',
+    'Log Type',
     'Run Date',
     'IPUs',
     'Cost/IPU/Month'
@@ -105,6 +113,7 @@ def normalize_column_names(df):
         'meteredvalue': 'Metered Value',
         'metered value': 'Metered Value',
         'volume (gbs)': 'Metered Value',
+        'metering date (utc)': 'Metering Date (UTC)',
         'audittime': 'Audit Time',
         'audit time': 'Audit Time',
         'obmtasktime(s)': 'OBM Task Time(s)',
@@ -122,6 +131,140 @@ def normalize_column_names(df):
     
     df = df.rename(columns=rename_dict)
     
+    return df
+
+
+def infer_log_type_from_filename(filename):
+    """Guess log type from a filename when schema is unavailable or ambiguous.
+
+    Mass-ingestion exports often use an org + ``mi`` suffix (e.g. ``byudevmi.csv``)
+    or an explicit ``massingest`` / ``mass_ingestion`` token.
+    """
+    if not filename:
+        return None
+
+    stem = Path(str(filename)).stem.lower()
+    compact = ''.join(ch for ch in stem if ch.isalnum())
+
+    if 'massingestion' in compact or 'massingest' in compact:
+        return LOG_TYPE_MASS_INGESTION
+
+    # Org-prefixed MI exports: byudevmi, cesprodmi, byucampusprodmi, etc.
+    if compact.endswith('mi') and len(compact) > 2:
+        return LOG_TYPE_MASS_INGESTION
+
+    return None
+
+
+def detect_log_type(columns, filename=None):
+    """Detect whether a file is Task Usage or Mass Ingestion.
+
+    Schema is the primary signal; filename is a fallback/hint.
+    """
+    lower_cols = {str(col).strip().lower() for col in columns}
+
+    mi_markers = {'job name', 'volume (gbs)'}
+    # After normalization these become Task Run ID / Metered Value; also
+    # check normalized names when detecting on already-normalized frames.
+    task_markers = {
+        'task object name', 'cores used', 'obm task time(s)',
+        'folder name', 'project name', 'audit time',
+    }
+
+    has_raw_mi = mi_markers.issubset(lower_cols) or (
+        'volume (gbs)' in lower_cols and 'agent name' in lower_cols
+    )
+    has_task_shape = bool(lower_cols & task_markers) or (
+        'task id' in lower_cols and 'metered value' in lower_cols and 'job name' not in lower_cols
+    )
+
+    filename_hint = infer_log_type_from_filename(filename)
+
+    if has_raw_mi and not has_task_shape:
+        return LOG_TYPE_MASS_INGESTION
+    if has_task_shape and not has_raw_mi:
+        return LOG_TYPE_TASK_USAGE
+    if filename_hint:
+        return filename_hint
+    if has_raw_mi:
+        return LOG_TYPE_MASS_INGESTION
+
+    # Normalized MI frames (post column rename) still look like agent + volume jobs
+    if (
+        'agent name' in lower_cols
+        and 'metered value' in lower_cols
+        and 'task run id' in lower_cols
+        and not has_task_shape
+    ):
+        return LOG_TYPE_MASS_INGESTION
+
+    return LOG_TYPE_TASK_USAGE
+
+
+def peek_log_type(uploaded_file):
+    """Read only headers from an upload and return the detected log type."""
+    filename = getattr(uploaded_file, 'name', '') or ''
+    try:
+        if filename.lower().endswith('.csv'):
+            header_df = pd.read_csv(uploaded_file, nrows=0)
+        else:
+            header_df = pd.read_excel(uploaded_file, nrows=0, engine='openpyxl')
+        if hasattr(uploaded_file, 'seek'):
+            uploaded_file.seek(0)
+        return detect_log_type(header_df.columns, filename)
+    except Exception:
+        if hasattr(uploaded_file, 'seek'):
+            uploaded_file.seek(0)
+        return infer_log_type_from_filename(filename) or LOG_TYPE_TASK_USAGE
+
+
+def normalize_mass_ingestion_df(df):
+    """Fill gaps so mass-ingestion rows match the standard task schema."""
+    original_missing_end = None
+
+    if 'Task Run ID' in df.columns:
+        if 'Task ID' not in df.columns:
+            df['Task ID'] = df['Task Run ID']
+        else:
+            missing_task_id = _is_missing_value(df['Task ID'])
+            df.loc[missing_task_id, 'Task ID'] = df.loc[missing_task_id, 'Task Run ID']
+
+    if 'Task Name' in df.columns:
+        if 'Task Type' not in df.columns:
+            df['Task Type'] = df['Task Name']
+        else:
+            missing_task_type = _is_missing_value(df['Task Type'])
+            if missing_task_type.any():
+                df.loc[missing_task_type, 'Task Type'] = df.loc[missing_task_type, 'Task Name']
+
+    if 'End Time' in df.columns and 'Metering Date (UTC)' in df.columns:
+        missing_end = _is_missing_value(df['End Time'])
+        original_missing_end = missing_end.copy()
+        metering_available = ~_is_missing_value(df['Metering Date (UTC)'])
+        fill_mask = missing_end & metering_available
+        if fill_mask.any():
+            metering_dates = pd.to_datetime(
+                df.loc[fill_mask, 'Metering Date (UTC)'], errors='coerce', dayfirst=True
+            )
+            df.loc[fill_mask, 'End Time'] = metering_dates.dt.strftime('%Y-%m-%d') + ' 23:59:59'
+
+    if 'Status' not in df.columns:
+        df['Status'] = 'Completed'
+
+    if 'Status' in df.columns:
+        missing_status = _is_missing_value(df['Status'])
+        if missing_status.any():
+            df.loc[missing_status, 'Status'] = 'Completed'
+
+        if 'End Time' in df.columns:
+            running_mask = (
+                original_missing_end
+                if original_missing_end is not None
+                else _is_missing_value(df['End Time'])
+            )
+            if running_mask.any():
+                df.loc[running_mask, 'Status'] = 'Running'
+
     return df
 
 
@@ -323,21 +466,25 @@ def add_cost_column(df):
     return df
 
 
-def process_and_merge_files(uploaded_files, org_assignments=None):
+def process_and_merge_files(uploaded_files, org_assignments=None, log_type_assignments=None):
     """
     Master function to process and merge multiple uploaded files.
     
     Orchestrates the entire pipeline:
     1. Read all Excel/CSV files
     2. Normalize column names
-    3. Assign org per file
-    4. Merge into single DataFrame
-    5. Add derived columns
-    6. Handle errors gracefully
+    3. Detect / apply log type (Task Usage vs Mass Ingestion)
+    4. Assign org per file
+    5. Merge into single DataFrame
+    6. Add derived columns
+    7. Handle errors gracefully
     
     Args:
         uploaded_files: List of uploaded file objects from Streamlit
         org_assignments: Dict mapping file names to org values {filename: org}
+        log_type_assignments: Dict mapping file names to log types
+            {filename: 'Task Usage'|'Mass Ingestion'}. When omitted, type is
+            detected from schema and filename.
         
     Returns:
         Tuple of (merged_df, error_messages)
@@ -346,6 +493,8 @@ def process_and_merge_files(uploaded_files, org_assignments=None):
     """
     if org_assignments is None:
         org_assignments = {}
+    if log_type_assignments is None:
+        log_type_assignments = {}
     
     dataframes = []
     errors = []
@@ -357,47 +506,20 @@ def process_and_merge_files(uploaded_files, org_assignments=None):
                 df = read_csv_file(uploaded_file)
             else:
                 df = read_excel_file(uploaded_file)
+
+            raw_columns = list(df.columns)
             
             # Normalize column names
             df = normalize_column_names(df)
 
-            # Mass-ingestion CSVs use a narrower schema than the standard task exports.
-            # Fill the missing pieces here so they flow through the same historical pipeline.
-            if 'Task Run ID' in df.columns:
-                if 'Task ID' not in df.columns:
-                    df['Task ID'] = df['Task Run ID']
-                else:
-                    missing_task_id = _is_missing_value(df['Task ID'])
-                    df.loc[missing_task_id, 'Task ID'] = df.loc[missing_task_id, 'Task Run ID']
+            log_type = log_type_assignments.get(uploaded_file.name)
+            if log_type not in LOG_TYPES:
+                log_type = detect_log_type(raw_columns, uploaded_file.name)
 
-            if 'Task Name' in df.columns and 'Task Type' not in df.columns:
-                df['Task Type'] = df['Task Name']
-            elif 'Task Name' in df.columns:
-                missing_task_type = _is_missing_value(df['Task Type']) if 'Task Type' in df.columns else pd.Series(False, index=df.index)
-                if missing_task_type.any():
-                    df.loc[missing_task_type, 'Task Type'] = df.loc[missing_task_type, 'Task Name']
+            if log_type == LOG_TYPE_MASS_INGESTION:
+                df = normalize_mass_ingestion_df(df)
 
-            if 'End Time' in df.columns and 'Metering Date (UTC)' in df.columns:
-                missing_end = _is_missing_value(df['End Time'])
-                original_missing_end = missing_end.copy()
-                metering_available = ~_is_missing_value(df['Metering Date (UTC)'])
-                fill_mask = missing_end & metering_available
-                if fill_mask.any():
-                    metering_dates = pd.to_datetime(df.loc[fill_mask, 'Metering Date (UTC)'], errors='coerce', dayfirst=True)
-                    df.loc[fill_mask, 'End Time'] = metering_dates.dt.strftime('%Y-%m-%d') + ' 23:59:59'
-
-            if 'Status' not in df.columns:
-                df['Status'] = 'Completed'
-
-            if 'Status' in df.columns:
-                missing_status = _is_missing_value(df['Status'])
-                if missing_status.any():
-                    df.loc[missing_status, 'Status'] = 'Completed'
-
-                if 'End Time' in df.columns:
-                    running_mask = original_missing_end if 'original_missing_end' in locals() else _is_missing_value(df['End Time'])
-                    if running_mask.any():
-                        df.loc[running_mask, 'Status'] = 'Running'
+            df['Log Type'] = log_type
             
             # Assign org for this file
             org = org_assignments.get(uploaded_file.name, 'Unknown')
