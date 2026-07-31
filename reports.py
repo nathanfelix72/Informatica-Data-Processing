@@ -150,6 +150,7 @@ def init_database():
             task_type TEXT,
             task_run_id TEXT,
             row_hash TEXT,
+            agent_name TEXT,
             project_name TEXT,
             folder_name TEXT,
             org TEXT,
@@ -183,6 +184,7 @@ def init_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_start_time ON tasks(start_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_end_time ON tasks(end_time)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_org ON tasks(org)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_name ON tasks(agent_name)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_project ON tasks(project_name)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_environment ON tasks(environment)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_task_type ON tasks(task_type)')
@@ -198,6 +200,12 @@ def init_database():
             cursor.execute('ALTER TABLE tasks ADD COLUMN row_hash TEXT')
         except Exception:
             # Some SQLite versions or locks may prevent altering; ignore if it fails
+            pass
+
+    if 'agent_name' not in cols:
+        try:
+            cursor.execute('ALTER TABLE tasks ADD COLUMN agent_name TEXT')
+        except Exception:
             pass
 
     # Ensure unique index on row_hash to avoid inserting identical rows
@@ -305,7 +313,7 @@ def _summarize_date_ranges(frame: pd.DataFrame) -> tuple[str | None, str | None,
     date_series = None
     for candidate in ['End Time', 'Start Time']:
         if candidate in frame.columns:
-            parsed = pd.to_datetime(frame[candidate], errors='coerce').dropna()
+            parsed = pd.to_datetime(frame[candidate], errors='coerce', dayfirst=True).dropna()
             if not parsed.empty:
                 date_series = parsed.dt.date
                 break
@@ -388,7 +396,7 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
     # re-uploading the same task data does not create a new hash.
     hash_columns = [
         'Task ID', 'Task Run ID', 'Task Name', 'Task Type', 'Project Name',
-        'Folder Name', 'Org', 'Environment', 'Start Time', 'End Time',
+        'Folder Name', 'Org', 'Environment', 'Agent Name', 'Start Time', 'End Time',
         'Metered Value',
     ]
     available_columns = [col for col in hash_columns if col in merged_df.columns]
@@ -418,7 +426,7 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
     # Normalize datetimes and numerics (same as before)
     for dt_col in ['Start Time', 'End Time', 'Start DateTime']:
         if dt_col in norm_df.columns:
-            norm_df[dt_col] = pd.to_datetime(norm_df[dt_col], errors='coerce')
+            norm_df[dt_col] = pd.to_datetime(norm_df[dt_col], errors='coerce', dayfirst=True)
             norm_df[dt_col] = norm_df[dt_col].dt.strftime('%Y-%m-%d %H:%M:%S')
             norm_df[dt_col] = norm_df[dt_col].fillna('')
 
@@ -447,6 +455,7 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
         'Task Name': 'task_name',
         'Task Type': 'task_type',
         'Task Run ID': 'task_run_id',
+        'Agent Name': 'agent_name',
         'Project Name': 'project_name',
         'Folder Name': 'folder_name',
         'Org': 'org',
@@ -465,7 +474,7 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
     # Hash should be stable on task identity; persisted record should retain metrics.
     insert_source_columns = [
         'Task ID', 'Task Name', 'Task Type', 'Task Run ID',
-        'Project Name', 'Folder Name', 'Org', 'Environment', 'Status',
+        'Agent Name', 'Project Name', 'Folder Name', 'Org', 'Environment', 'Status',
         'Start Time', 'End Time', 'IPUs', 'Cost/IPU/Month', 'Metered Value', 'Cores Used'
     ]
     present_source_columns = [col for col in insert_source_columns if col in merged_df.columns]
@@ -474,7 +483,7 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
 
     for dt_col in ['Start Time', 'End Time']:
         if dt_col in staging_df.columns:
-            staging_df[dt_col] = pd.to_datetime(staging_df[dt_col], errors='coerce')
+            staging_df[dt_col] = pd.to_datetime(staging_df[dt_col], errors='coerce', dayfirst=True)
             staging_df[dt_col] = staging_df[dt_col].dt.strftime('%Y-%m-%d %H:%M:%S')
             staging_df[dt_col] = staging_df[dt_col].fillna('')
 
@@ -500,7 +509,7 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
     insert_cols = [
         col for col in [
             'task_id', 'task_name', 'task_type', 'task_run_id', 'row_hash',
-            'project_name', 'folder_name', 'org', 'environment', 'status',
+            'agent_name', 'project_name', 'folder_name', 'org', 'environment', 'status',
             'start_time', 'end_time', 'ipus', 'cost', 'metered_value', 'cores_used'
         ] if col in staging_df.columns
     ]
@@ -580,7 +589,8 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
 
 def delete_tasks_by_date_range(start_date: str, end_date: str, org: str = None,
                                project: str = None, environment: str = None,
-                               task_type: str = None, status: str = None) -> tuple[int, int]:
+                               task_type: str = None, agent_name: str = None,
+                               status: str = None) -> tuple[int, int]:
     """Delete historical task rows in a date range and return deleted and remaining counts."""
     init_database()
     conn = sqlite3.connect(DB_PATH)
@@ -601,6 +611,9 @@ def delete_tasks_by_date_range(start_date: str, end_date: str, org: str = None,
     if task_type:
         query += ' AND task_type = ?'
         params.append(task_type)
+    if agent_name:
+        query += ' AND agent_name = ?'
+        params.append(agent_name)
     if status:
         query += ' AND status = ?'
         params.append(status)
@@ -963,6 +976,7 @@ def get_missing_task_date_ranges(start_date, end_date, org: str = None, project:
 def get_tasks_by_date_range(start_date: str, end_date: str, 
                             org: str = None, project: str = None,
                             environment: str = None, task_type: str = None,
+                            agent_name: str = None,
                             status: str = None) -> pd.DataFrame:
     """
     Get task records filtered by date range and optional dimensions.
@@ -974,6 +988,7 @@ def get_tasks_by_date_range(start_date: str, end_date: str,
         project: Filter by project name (optional)
         environment: Filter by environment (optional)
         task_type: Filter by task type (optional)
+        agent_name: Filter by agent name (optional)
         status: Filter by status (optional)
     
     Returns:
@@ -997,6 +1012,9 @@ def get_tasks_by_date_range(start_date: str, end_date: str,
     if task_type:
         query += ' AND task_type = ?'
         params.append(task_type)
+    if agent_name:
+        query += ' AND agent_name = ?'
+        params.append(agent_name)
     if status:
         query += ' AND status = ?'
         params.append(status)
@@ -1011,7 +1029,8 @@ def get_tasks_by_date_range(start_date: str, end_date: str,
 
 def get_daily_stats_by_date_range(start_date: str, end_date: str,
                                    org: str = None, project: str = None,
-                                   environment: str = None) -> pd.DataFrame:
+                                   environment: str = None,
+                                   agent_name: str = None) -> pd.DataFrame:
     """
     Get daily aggregated statistics for a date range.
     
@@ -1042,6 +1061,9 @@ def get_daily_stats_by_date_range(start_date: str, end_date: str,
     if environment:
         query += ' AND environment = ?'
         params.append(environment)
+    if agent_name:
+        query += ' AND agent_name = ?'
+        params.append(agent_name)
 
     query += ' GROUP BY DATE(end_time) ORDER BY DATE(end_time)'
 
@@ -1114,6 +1136,28 @@ def get_environment_stats_by_date_range(start_date: str, end_date: str) -> pd.Da
     env_stats = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return env_stats
+
+
+def get_agent_stats_by_date_range(start_date: str, end_date: str) -> pd.DataFrame:
+    """Get statistics by agent for a date range."""
+    init_database()
+    conn = sqlite3.connect(DB_PATH)
+
+    ipu_factor = float(calculations.IPU_CONVERSION_FACTOR)
+    cost_per_ipu = float(calculations.COST_PER_IPU_MONTH)
+
+    query = (
+        "SELECT agent_name, COUNT(*) AS task_count, "
+        "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
+        "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
+        "COUNT(DISTINCT task_id) AS unique_tasks "
+        "FROM tasks WHERE end_time >= ? AND end_time <= ? "
+        "GROUP BY agent_name ORDER BY total_ipus DESC"
+    )
+    params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    agent_stats = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return agent_stats
 
 
 def get_task_type_stats_by_date_range(start_date: str, end_date: str) -> pd.DataFrame:

@@ -6,6 +6,7 @@ A Streamlit web application for consolidating multiple Informatica usage spreads
 
 ### Data Processing
 - **Multiple File Upload**: Support for drag-and-drop upload of multiple Excel files
+- **Mass-Ingestion CSV Support**: Normalizes log-style CSVs with `Job Name`, `Task Name`, `Agent Name`, `Job Start Time`, `Job End Time`, and `Volume` columns into the same historical pipeline
 - **Automatic Normalization**: Handles column name variations across files
 - **Efficient Merging**: Optimized for datasets with 500,000+ rows
 - **Calculated Columns**:
@@ -25,6 +26,7 @@ A Streamlit web application for consolidating multiple Informatica usage spreads
   - Task Type
 - **Column Statistics**: Descriptive statistics for all numeric columns
 - **History Management**: Review saved import batches and delete historical rows by date range
+- **Agent-Level Tracking**: Keep mass-ingestion agent names in the saved historical data and summary reports
 
 ### Export Options
 - **Excel Export**: Download consolidated data as .xlsx file

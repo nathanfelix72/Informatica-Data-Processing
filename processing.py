@@ -14,7 +14,7 @@ from mappings import get_org_name
 
 
 def _to_datetime_mixed(values):
-    return pd.to_datetime(values, errors='coerce', format='mixed')
+    return pd.to_datetime(values, errors='coerce', format='mixed', dayfirst=True)
 
 
 # Standard column names expected in output
@@ -24,6 +24,7 @@ STANDARD_COLUMNS = [
     'Task Object Name',
     'Task Type',
     'Task Run ID',
+    'Agent Name',
     'Project Name',
     'Folder Name',
     'Org ID',
@@ -41,6 +42,15 @@ STANDARD_COLUMNS = [
     'IPUs',
     'Cost/IPU/Month'
 ]
+
+
+def _is_missing_value(series):
+    """Return a boolean mask for values that should be treated as missing."""
+    if series is None:
+        return pd.Series(dtype=bool)
+
+    text_values = series.astype(str).str.strip().str.lower()
+    return series.isna() | text_values.isin(['', 'na', 'nat', 'none', 'nan'])
 
 
 def normalize_column_names(df):
@@ -71,12 +81,15 @@ def normalize_column_names(df):
         'task type': 'Task Type',
         'taskrunid': 'Task Run ID',
         'task run id': 'Task Run ID',
+        'job name': 'Task Run ID',
+        'agent name': 'Agent Name',
         'projectname': 'Project Name',
         'project name': 'Project Name',
         'foldername': 'Folder Name',
         'folder name': 'Folder Name',
         'orgid': 'Org ID',
         'org id': 'Org ID',
+        'environment name': 'Environment',
         'environment': 'Environment',
         'environement': 'Environment',
         'environmentid': 'Environment ID',
@@ -85,10 +98,13 @@ def normalize_column_names(df):
         'cores used': 'Cores Used',
         'starttime': 'Start Time',
         'start time': 'Start Time',
+        'job start time (utc)': 'Start Time',
         'endtime': 'End Time',
         'end time': 'End Time',
+        'job end time (utc)': 'End Time',
         'meteredvalue': 'Metered Value',
         'metered value': 'Metered Value',
+        'volume (gbs)': 'Metered Value',
         'audittime': 'Audit Time',
         'audit time': 'Audit Time',
         'obmtasktime(s)': 'OBM Task Time(s)',
@@ -344,6 +360,44 @@ def process_and_merge_files(uploaded_files, org_assignments=None):
             
             # Normalize column names
             df = normalize_column_names(df)
+
+            # Mass-ingestion CSVs use a narrower schema than the standard task exports.
+            # Fill the missing pieces here so they flow through the same historical pipeline.
+            if 'Task Run ID' in df.columns:
+                if 'Task ID' not in df.columns:
+                    df['Task ID'] = df['Task Run ID']
+                else:
+                    missing_task_id = _is_missing_value(df['Task ID'])
+                    df.loc[missing_task_id, 'Task ID'] = df.loc[missing_task_id, 'Task Run ID']
+
+            if 'Task Name' in df.columns and 'Task Type' not in df.columns:
+                df['Task Type'] = df['Task Name']
+            elif 'Task Name' in df.columns:
+                missing_task_type = _is_missing_value(df['Task Type']) if 'Task Type' in df.columns else pd.Series(False, index=df.index)
+                if missing_task_type.any():
+                    df.loc[missing_task_type, 'Task Type'] = df.loc[missing_task_type, 'Task Name']
+
+            if 'End Time' in df.columns and 'Metering Date (UTC)' in df.columns:
+                missing_end = _is_missing_value(df['End Time'])
+                original_missing_end = missing_end.copy()
+                metering_available = ~_is_missing_value(df['Metering Date (UTC)'])
+                fill_mask = missing_end & metering_available
+                if fill_mask.any():
+                    metering_dates = pd.to_datetime(df.loc[fill_mask, 'Metering Date (UTC)'], errors='coerce', dayfirst=True)
+                    df.loc[fill_mask, 'End Time'] = metering_dates.dt.strftime('%Y-%m-%d') + ' 23:59:59'
+
+            if 'Status' not in df.columns:
+                df['Status'] = 'Completed'
+
+            if 'Status' in df.columns:
+                missing_status = _is_missing_value(df['Status'])
+                if missing_status.any():
+                    df.loc[missing_status, 'Status'] = 'Completed'
+
+                if 'End Time' in df.columns:
+                    running_mask = original_missing_end if 'original_missing_end' in locals() else _is_missing_value(df['End Time'])
+                    if running_mask.any():
+                        df.loc[running_mask, 'Status'] = 'Running'
             
             # Assign org for this file
             org = org_assignments.get(uploaded_file.name, 'Unknown')

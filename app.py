@@ -43,6 +43,7 @@ from reports import (
     get_org_stats_by_date_range,
     get_project_stats_by_date_range,
     get_environment_stats_by_date_range,
+    get_agent_stats_by_date_range,
     get_task_type_stats_by_date_range,
     get_status_stats_by_date_range,
     detect_anomalies_in_date_range,
@@ -150,6 +151,7 @@ def display_file_upload():
         accept_multiple_files=True,
         help="Drag and drop multiple files or click to select"
     )
+    st.caption("Mass-ingestion CSVs with Job Name, Task Name, Agent Name, and Volume columns are normalized automatically.")
     
     org_assignments = {}
 
@@ -489,11 +491,11 @@ def display_status_analysis(df):
                 
                 # Parse End DateTime if available, otherwise fall back to Start Time
                 if 'End Time' in filtered_df_time.columns:
-                    filtered_df_time['End DateTime'] = pd.to_datetime(filtered_df_time['End Time'], errors='coerce', format='mixed')
+                    filtered_df_time['End DateTime'] = pd.to_datetime(filtered_df_time['End Time'], errors='coerce', format='mixed', dayfirst=True)
                 elif 'Start DateTime' in filtered_df_time.columns:
-                    filtered_df_time['End DateTime'] = pd.to_datetime(filtered_df_time['Start DateTime'], errors='coerce', format='mixed')
+                    filtered_df_time['End DateTime'] = pd.to_datetime(filtered_df_time['Start DateTime'], errors='coerce', format='mixed', dayfirst=True)
                 elif 'Start Time' in filtered_df_time.columns:
-                    filtered_df_time['End DateTime'] = pd.to_datetime(filtered_df_time['Start Time'], errors='coerce', format='mixed')
+                    filtered_df_time['End DateTime'] = pd.to_datetime(filtered_df_time['Start Time'], errors='coerce', format='mixed', dayfirst=True)
                 else:
                     st.info("No End Time data available for hourly breakdown")
                     filtered_df_time = None
@@ -591,13 +593,13 @@ def display_time_series_analysis(df):
     # Prepare analysis timestamp (prefer End Time so tasks count on the day they finish)
     df_time = df_filtered.copy()
     if 'End Time' in df_time.columns:
-        df_time['End DateTime'] = pd.to_datetime(df_time['End Time'], errors='coerce', format='mixed')
+        df_time['End DateTime'] = pd.to_datetime(df_time['End Time'], errors='coerce', format='mixed', dayfirst=True)
         ts_col = 'End DateTime'
     elif 'Start DateTime' in df_time.columns:
-        df_time['Start DateTime'] = pd.to_datetime(df_time['Start DateTime'], errors='coerce', format='mixed')
+        df_time['Start DateTime'] = pd.to_datetime(df_time['Start DateTime'], errors='coerce', format='mixed', dayfirst=True)
         ts_col = 'Start DateTime'
     else:
-        df_time['Start DateTime'] = pd.to_datetime(df_time['Start Time'], errors='coerce', format='mixed')
+        df_time['Start DateTime'] = pd.to_datetime(df_time['Start Time'], errors='coerce', format='mixed', dayfirst=True)
         ts_col = 'Start DateTime'
 
     df_time = df_time.dropna(subset=[ts_col])
@@ -757,13 +759,13 @@ def display_time_series_analysis(df):
         if 'End Time' in df_time.columns:
             df_duration = df_time.copy()
             # Ensure both start and end are datetimes
-            df_duration['End Time'] = pd.to_datetime(df_duration['End Time'], errors='coerce', format='mixed')
+            df_duration['End Time'] = pd.to_datetime(df_duration['End Time'], errors='coerce', format='mixed', dayfirst=True)
             # Use the parsed Start DateTime column if available
             if 'Start DateTime' in df_duration.columns:
-                df_duration['Start DateTime'] = pd.to_datetime(df_duration['Start DateTime'], errors='coerce', format='mixed')
+                df_duration['Start DateTime'] = pd.to_datetime(df_duration['Start DateTime'], errors='coerce', format='mixed', dayfirst=True)
                 start_col = 'Start DateTime'
             else:
-                df_duration['Start Time'] = pd.to_datetime(df_duration['Start Time'], errors='coerce', format='mixed')
+                df_duration['Start Time'] = pd.to_datetime(df_duration['Start Time'], errors='coerce', format='mixed', dayfirst=True)
                 start_col = 'Start Time'
 
             # Only compute durations where both datetimes are present
@@ -798,7 +800,7 @@ def display_summaries(df):
     df_filtered = df.copy()
     
     # Tabs for different summary views
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["By Org", "By Environment", "By Project", "By Project/Folder", "By Task Type"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["By Org", "By Environment", "By Project", "By Project/Folder", "By Task Type", "By Agent"])
     
     with tab1:
         if 'Org' in df_filtered.columns:
@@ -843,6 +845,13 @@ def display_summaries(df):
             st.dataframe(summary, width="stretch")
         else:
             st.info("Task Type column not available")
+
+    with tab6:
+        if 'Agent Name' in df_filtered.columns:
+            summary = get_summary_by_group(df_filtered, 'Agent Name')
+            st.dataframe(summary, width="stretch")
+        else:
+            st.info("Agent Name column not available")
 
 
 def display_export_options(df):
@@ -933,6 +942,10 @@ def display_export_options(df):
             # By Environment
             if 'Environment' in df.columns:
                 get_summary_by_group(df, 'Environment').to_excel(writer, sheet_name='By Env')
+
+            # By Agent
+            if 'Agent Name' in df.columns:
+                get_summary_by_group(df, 'Agent Name').to_excel(writer, sheet_name='By Agent')
         
         summary_buffer.seek(0)
         
@@ -2290,9 +2303,9 @@ def display_historical_analysis():
                 else:
                     org_daily = _effective_metrics(org_daily_raw)
                     if 'end_time' in org_daily.columns:
-                        org_daily['date'] = pd.to_datetime(org_daily['end_time'], errors='coerce').dt.date
+                        org_daily['date'] = pd.to_datetime(org_daily['end_time'], errors='coerce', dayfirst=True).dt.date
                     elif 'start_time' in org_daily.columns:
-                        org_daily['date'] = pd.to_datetime(org_daily['start_time'], errors='coerce').dt.date
+                        org_daily['date'] = pd.to_datetime(org_daily['start_time'], errors='coerce', dayfirst=True).dt.date
                     else:
                         org_daily['date'] = pd.NaT
 
@@ -2434,6 +2447,25 @@ def display_historical_analysis():
                         st.bar_chart(org_stats.set_index('org')[['total_cost']], width='stretch')
                     
                     st.dataframe(org_stats, width='stretch', hide_index=True)
+
+                st.divider()
+                st.subheader("Breakdown by Agent")
+                st.write("See which source agents are contributing the most mass-ingestion volume")
+
+                agent_stats = get_agent_stats_by_date_range(
+                    start_date.isoformat(), analysis_end.isoformat()
+                )
+
+                if agent_stats.empty:
+                    st.info("No agent data for this date range")
+                else:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.bar_chart(agent_stats.set_index('agent_name')[['total_ipus']], width='stretch')
+                    with col2:
+                        st.bar_chart(agent_stats.set_index('agent_name')[['total_cost']], width='stretch')
+
+                    st.dataframe(agent_stats, width='stretch', hide_index=True)
         
             with tab4:
                 st.subheader("Breakdown by Project")
@@ -2498,7 +2530,7 @@ def display_historical_analysis():
                         start_date.isoformat(), analysis_end.isoformat(), org=org_param
                     )
                     if not daily_stats.empty:
-                        daily_stats['date'] = pd.to_datetime(daily_stats['date'], errors='coerce')
+                        daily_stats['date'] = pd.to_datetime(daily_stats['date'], errors='coerce', dayfirst=True)
                         daily_stats = daily_stats.dropna(subset=['date']).sort_values('date')
                         st.line_chart(daily_stats.set_index('date')[[metric]], width='stretch')
 
@@ -2554,9 +2586,9 @@ def display_historical_analysis():
                         else:
                             raw_task_rows = _effective_metrics(raw_task_rows)
                             if 'end_time' in raw_task_rows.columns:
-                                raw_task_rows['task_date'] = pd.to_datetime(raw_task_rows['end_time'], errors='coerce').dt.date
+                                raw_task_rows['task_date'] = pd.to_datetime(raw_task_rows['end_time'], errors='coerce', dayfirst=True).dt.date
                             elif 'start_time' in raw_task_rows.columns:
-                                raw_task_rows['task_date'] = pd.to_datetime(raw_task_rows['start_time'], errors='coerce').dt.date
+                                raw_task_rows['task_date'] = pd.to_datetime(raw_task_rows['start_time'], errors='coerce', dayfirst=True).dt.date
                             else:
                                 raw_task_rows['task_date'] = pd.NaT
 
@@ -2682,7 +2714,7 @@ def display_historical_analysis():
                     if rows_to_delete.empty:
                         st.info("No rows match the selected date range.")
                     else:
-                        preview_columns = [col for col in ['end_time', 'org', 'project_name', 'task_name', 'task_run_id', 'status'] if col in rows_to_delete.columns]
+                        preview_columns = [col for col in ['end_time', 'agent_name', 'org', 'project_name', 'task_name', 'task_run_id', 'status'] if col in rows_to_delete.columns]
                         st.dataframe(
                             rows_to_delete[preview_columns].head(500),
                             width='stretch',
