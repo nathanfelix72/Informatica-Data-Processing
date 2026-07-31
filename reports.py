@@ -945,6 +945,28 @@ def get_task_date_range() -> tuple:
     return (result[0], result[1])
 
 
+def _collapse_dates_to_ranges(missing_dates: list) -> list[tuple]:
+    """Collapse a sorted list of dates into inclusive (start, end) ranges."""
+    if not missing_dates:
+        return []
+
+    missing_ranges = []
+    range_start = missing_dates[0]
+    previous_date = missing_dates[0]
+
+    for current_date in missing_dates[1:]:
+        if current_date == previous_date + timedelta(days=1):
+            previous_date = current_date
+            continue
+
+        missing_ranges.append((range_start, previous_date))
+        range_start = current_date
+        previous_date = current_date
+
+    missing_ranges.append((range_start, previous_date))
+    return missing_ranges
+
+
 def get_missing_task_date_ranges(start_date, end_date, org: str = None, project: str = None,
                                  environment: str = None, task_type: str = None,
                                  status: str = None, log_type: str = None) -> list[tuple]:
@@ -971,25 +993,73 @@ def get_missing_task_date_ranges(start_date, end_date, org: str = None, project:
 
     observed_dates = {pd.to_datetime(value).date() for value in daily_stats['date'].dropna()}
     missing_dates = sorted(set(expected_dates) - observed_dates)
+    return _collapse_dates_to_ranges(missing_dates)
 
-    if not missing_dates:
-        return []
 
-    missing_ranges = []
-    range_start = missing_dates[0]
-    previous_date = missing_dates[0]
+def get_org_coverage_gaps(start_date, end_date, log_type: str = None) -> pd.DataFrame:
+    """Return per-org (and log type) coverage plus missing date ranges.
 
-    for current_date in missing_dates[1:]:
-        if current_date == previous_date + timedelta(days=1):
-            previous_date = current_date
-            continue
+    Source filenames are not stored on historical rows; organization is the
+    label assigned at upload and is the best proxy for which spreadsheet
+    coverage is missing.
+    """
+    start_dt = pd.to_datetime(start_date).date()
+    end_dt = pd.to_datetime(end_date).date()
+    if start_dt > end_dt:
+        return pd.DataFrame()
 
-        missing_ranges.append((range_start, previous_date))
-        range_start = current_date
-        previous_date = current_date
+    init_database()
+    conn = sqlite3.connect(DB_PATH)
 
-    missing_ranges.append((range_start, previous_date))
-    return missing_ranges
+    query = (
+        "SELECT COALESCE(NULLIF(TRIM(org), ''), 'Unknown') AS org, "
+        "COALESCE(NULLIF(TRIM(log_type), ''), 'Task Usage') AS log_type, "
+        "DATE(end_time) AS date, "
+        "COUNT(*) AS task_count "
+        "FROM tasks "
+        "WHERE end_time >= ? AND end_time <= ?"
+    )
+    params = [f'{start_dt.isoformat()} 00:00:00', f'{end_dt.isoformat()} 23:59:59']
+    query, params = _append_log_type_filter(query, params, log_type)
+    query += " GROUP BY org, log_type, DATE(end_time) ORDER BY org, log_type, DATE(end_time)"
+
+    daily = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+
+    if daily.empty:
+        return pd.DataFrame(columns=[
+            'org', 'log_type', 'first_date', 'last_date', 'days_present',
+            'days_missing', 'gap_count', 'missing_ranges',
+        ])
+
+    daily['date'] = pd.to_datetime(daily['date'], errors='coerce').dt.date
+    daily = daily.dropna(subset=['date'])
+    expected_dates = set(pd.date_range(start=start_dt, end=end_dt, freq='D').date)
+
+    rows = []
+    for (org, row_log_type), group in daily.groupby(['org', 'log_type'], dropna=False):
+        present = {d for d in group['date'].tolist() if d is not None}
+        missing = sorted(expected_dates - present)
+        ranges = _collapse_dates_to_ranges(missing)
+        range_labels = [
+            str(start) if start == end else f'{start} to {end}'
+            for start, end in ranges
+        ]
+        rows.append({
+            'org': org,
+            'log_type': row_log_type,
+            'first_date': min(present) if present else None,
+            'last_date': max(present) if present else None,
+            'days_present': len(present),
+            'days_missing': len(missing),
+            'gap_count': len(ranges),
+            'missing_ranges': '; '.join(range_labels) if range_labels else '',
+        })
+
+    coverage = pd.DataFrame(rows)
+    if coverage.empty:
+        return coverage
+    return coverage.sort_values(['days_missing', 'org', 'log_type'], ascending=[False, True, True]).reset_index(drop=True)
 
 
 def get_tasks_by_date_range(start_date: str, end_date: str, 

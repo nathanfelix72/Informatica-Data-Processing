@@ -43,6 +43,7 @@ from reports import (
     get_tasks_by_date_range,
     get_task_date_range,
     get_missing_task_date_ranges,
+    get_org_coverage_gaps,
     get_daily_stats_by_date_range,
     get_org_stats_by_date_range,
     get_project_stats_by_date_range,
@@ -1158,20 +1159,65 @@ def display_historical_analysis():
         delete_tasks_by_date_range = partial(_reports.delete_tasks_by_date_range, log_type=log_type)
 
         missing_ranges = get_missing_task_date_ranges(min_date, max_date, log_type=log_type)
-        if missing_ranges:
-            range_labels = []
-            for range_start, range_end in missing_ranges[:5]:
-                if range_start == range_end:
-                    range_labels.append(str(range_start))
-                else:
-                    range_labels.append(f"{range_start} to {range_end}")
+        coverage_gaps = get_org_coverage_gaps(min_date, max_date, log_type=log_type)
+        orgs_with_gaps = (
+            coverage_gaps[coverage_gaps['days_missing'] > 0]
+            if not coverage_gaps.empty else coverage_gaps
+        )
 
-            extra_count = len(missing_ranges) - len(range_labels)
-            suffix = f" and {extra_count} more gap(s)" if extra_count > 0 else ""
-            scope = f" ({log_type_choice})" if log_type else ""
-            st.warning(
-                f"Missing data detected{scope} on {len(missing_ranges)} gap(s): {', '.join(range_labels)}{suffix}."
-            )
+        if missing_ranges or (orgs_with_gaps is not None and not orgs_with_gaps.empty):
+            if missing_ranges:
+                range_labels = []
+                for range_start, range_end in missing_ranges[:5]:
+                    if range_start == range_end:
+                        range_labels.append(str(range_start))
+                    else:
+                        range_labels.append(f"{range_start} to {range_end}")
+
+                extra_count = len(missing_ranges) - len(range_labels)
+                suffix = f" and {extra_count} more gap(s)" if extra_count > 0 else ""
+                scope = f" ({log_type_choice})" if log_type else ""
+                st.warning(
+                    f"Missing data detected{scope} on {len(missing_ranges)} global gap(s): "
+                    f"{', '.join(range_labels)}{suffix}."
+                )
+            else:
+                st.info("Every calendar day has at least some data, but individual organizations still have gaps.")
+
+            if orgs_with_gaps is not None and not orgs_with_gaps.empty:
+                st.caption(
+                    "Gaps by organization (org is assigned when you upload each spreadsheet — "
+                    "source filenames are not stored in history)."
+                )
+                # Compact summary line: which orgs need files
+                org_summaries = []
+                for _, row in orgs_with_gaps.head(8).iterrows():
+                    sample_gaps = row['missing_ranges']
+                    if sample_gaps and len(sample_gaps) > 90:
+                        sample_gaps = sample_gaps[:87] + '...'
+                    org_summaries.append(
+                        f"**{row['org']}** ({row['log_type']}): "
+                        f"has {row['first_date']} → {row['last_date']}, "
+                        f"missing {int(row['days_missing'])} day(s) in {int(row['gap_count'])} gap(s)"
+                        + (f" — {sample_gaps}" if sample_gaps else "")
+                    )
+                for line in org_summaries:
+                    st.markdown(f"- {line}")
+                if len(orgs_with_gaps) > 8:
+                    st.caption(f"…and {len(orgs_with_gaps) - 8} more org/log-type combination(s) with gaps.")
+
+                with st.expander("Full missing-coverage table by organization", expanded=False):
+                    display_coverage = orgs_with_gaps.rename(columns={
+                        'org': 'Organization',
+                        'log_type': 'Log Type',
+                        'first_date': 'First Date Present',
+                        'last_date': 'Last Date Present',
+                        'days_present': 'Days Present',
+                        'days_missing': 'Days Missing',
+                        'gap_count': 'Gap Count',
+                        'missing_ranges': 'Missing Ranges',
+                    })
+                    st.dataframe(display_coverage, width='stretch', hide_index=True)
         else:
             scope = f" for {log_type_choice}" if log_type else ""
             st.success(f"No missing days detected{scope} across the full available date span.")
