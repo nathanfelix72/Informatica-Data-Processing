@@ -44,6 +44,8 @@ from reports import (
     get_task_date_range,
     get_missing_task_date_ranges,
     get_org_coverage_gaps,
+    format_display_date,
+    format_display_date_range,
     get_daily_stats_by_date_range,
     get_org_stats_by_date_range,
     get_project_stats_by_date_range,
@@ -1106,7 +1108,9 @@ def display_historical_analysis():
         min_date = pd.to_datetime(min_date_str).date()
         max_date = pd.to_datetime(max_date_str).date()
         
-        st.write(f"Data available from **{min_date}** to **{max_date}**")
+        st.write(
+            f"Data available from **{format_display_date(min_date)}** to **{format_display_date(max_date)}**"
+        )
 
         default_start_date = max(min_date, (max_date - timedelta(days=30)))
         default_end_date = max_date
@@ -1167,12 +1171,10 @@ def display_historical_analysis():
 
         if missing_ranges or (orgs_with_gaps is not None and not orgs_with_gaps.empty):
             if missing_ranges:
-                range_labels = []
-                for range_start, range_end in missing_ranges[:5]:
-                    if range_start == range_end:
-                        range_labels.append(str(range_start))
-                    else:
-                        range_labels.append(f"{range_start} to {range_end}")
+                range_labels = [
+                    format_display_date_range(range_start, range_end)
+                    for range_start, range_end in missing_ranges[:5]
+                ]
 
                 extra_count = len(missing_ranges) - len(range_labels)
                 suffix = f" and {extra_count} more gap(s)" if extra_count > 0 else ""
@@ -1233,7 +1235,7 @@ def display_historical_analysis():
             st.info(f"Analysis uses data through {analysis_end} (yesterday) to avoid partial-day counts.")
 
         def _fmt_date(d):
-            return f"{d.strftime('%B')} {d.day}"
+            return format_display_date(d)
 
         def _fmt_datetime_now():
             now = datetime.now()
@@ -1698,7 +1700,9 @@ def display_historical_analysis():
                     st.info("Turn on at least one time period to generate the narrative summary.")
                     return
 
-                anchor = end_date - timedelta(days=1)  # analyze through yesterday
+                # Use the same analysis end bound as the rest of historical analysis
+                # (through yesterday / selected end), not a separate off-by-one window.
+                anchor = analysis_end
 
                 def _month_to_date_ranges(anchor_date):
                     cur_start = anchor_date.replace(day=1)
@@ -1790,12 +1794,16 @@ def display_historical_analysis():
                         _normalize_dimension_value(value)
                         for frame in period_frames.values()
                         if frame is not None and not frame.empty and dimension_key in frame.columns
-                        for value in frame[dimension_key].dropna().tolist()
+                        for value in frame[dimension_key].tolist()
                     })
 
                     lines = []
                     if not dimension_values:
-                        lines.append(f"No {dimension_label.lower()}-level data available.")
+                        filter_note = f" for log type '{log_type_choice}'" if log_type else ""
+                        lines.append(
+                            f"No {dimension_label.lower()}-level data available{filter_note} "
+                            f"in the selected period(s)."
+                        )
                         lines.append("")
                         return lines, []
 
@@ -1809,13 +1817,13 @@ def display_historical_analysis():
                                 cur_val = 0.0
                             else:
                                 cur_mask = cur_df[dimension_key].map(_normalize_dimension_value) == dimension_name
-                                cur_val = float(cur_df[cur_mask]['total_ipus'].sum())
+                                cur_val = float(cur_df.loc[cur_mask, 'total_ipus'].sum()) if cur_mask.any() else 0.0
 
                             if prev_df.empty or dimension_key not in prev_df.columns:
                                 prev_val = 0.0
                             else:
                                 prev_mask = prev_df[dimension_key].map(_normalize_dimension_value) == dimension_name
-                                prev_val = float(prev_df[prev_mask]['total_ipus'].sum())
+                                prev_val = float(prev_df.loc[prev_mask, 'total_ipus'].sum()) if prev_mask.any() else 0.0
 
                             lines.append(
                                 f"  {period_name}: {cur_val:,.2f} IPUs -> {prev_val:,.2f} previous "

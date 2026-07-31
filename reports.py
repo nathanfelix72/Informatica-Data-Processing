@@ -967,6 +967,25 @@ def _collapse_dates_to_ranges(missing_dates: list) -> list[tuple]:
     return missing_ranges
 
 
+def format_display_date(value) -> str:
+    """Format a date as 'June 5, 2026'."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ''
+    parsed = pd.to_datetime(value, errors='coerce')
+    if pd.isna(parsed):
+        return str(value)
+    day = parsed.day
+    return f"{parsed.strftime('%B')} {day}, {parsed.year}"
+
+
+def format_display_date_range(start, end) -> str:
+    """Format a single day or inclusive range with month names."""
+    start_label = format_display_date(start)
+    if start == end or end is None:
+        return start_label
+    return f"{start_label} to {format_display_date(end)}"
+
+
 def get_missing_task_date_ranges(start_date, end_date, org: str = None, project: str = None,
                                  environment: str = None, task_type: str = None,
                                  status: str = None, log_type: str = None) -> list[tuple]:
@@ -1041,15 +1060,14 @@ def get_org_coverage_gaps(start_date, end_date, log_type: str = None) -> pd.Data
         present = {d for d in group['date'].tolist() if d is not None}
         missing = sorted(expected_dates - present)
         ranges = _collapse_dates_to_ranges(missing)
-        range_labels = [
-            str(start) if start == end else f'{start} to {end}'
-            for start, end in ranges
-        ]
+        range_labels = [format_display_date_range(start, end) for start, end in ranges]
+        first_present = min(present) if present else None
+        last_present = max(present) if present else None
         rows.append({
             'org': org,
             'log_type': row_log_type,
-            'first_date': min(present) if present else None,
-            'last_date': max(present) if present else None,
+            'first_date': format_display_date(first_present),
+            'last_date': format_display_date(last_present),
             'days_present': len(present),
             'days_missing': len(missing),
             'gap_count': len(ranges),
@@ -1176,7 +1194,7 @@ def get_org_stats_by_date_range(start_date: str, end_date: str,
     cost_per_ipu = float(calculations.COST_PER_IPU_MONTH)
 
     query = (
-        "SELECT org, COUNT(*) AS task_count, "
+        "SELECT COALESCE(NULLIF(TRIM(org), ''), 'Unknown') AS org, COUNT(*) AS task_count, "
         "COALESCE(SUM(COALESCE(ipus, COALESCE(metered_value, 0) * ?)), 0) AS total_ipus, "
         "COALESCE(SUM(COALESCE(cost, COALESCE(ipus, COALESCE(metered_value, 0) * ?) * ?)), 0) AS total_cost, "
         "COUNT(DISTINCT task_id) AS unique_tasks "
@@ -1184,7 +1202,7 @@ def get_org_stats_by_date_range(start_date: str, end_date: str,
     )
     params = [ipu_factor, ipu_factor, cost_per_ipu, f'{start_date} 00:00:00', f'{end_date} 23:59:59']
     query, params = _append_log_type_filter(query, params, log_type)
-    query += " GROUP BY org ORDER BY total_ipus DESC"
+    query += " GROUP BY COALESCE(NULLIF(TRIM(org), ''), 'Unknown') ORDER BY total_ipus DESC"
     org_stats = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return org_stats
