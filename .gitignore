@@ -12,6 +12,7 @@ __pycache__/
 *.db
 *.sqlite3
 *.log
+*.csv
 
 # Environment files
 *.env

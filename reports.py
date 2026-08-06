@@ -1078,7 +1078,14 @@ def get_task_date_range() -> tuple:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    cursor.execute('SELECT MIN(end_time), MAX(end_time) FROM tasks WHERE end_time IS NOT NULL')
+    # Ignore future-dated rows when reporting available history.
+    # The analysis views already stop at yesterday to avoid partial-day counts,
+    # so future timestamps would incorrectly extend the date picker window.
+    analysis_cutoff = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+    cursor.execute(
+        'SELECT MIN(end_time), MAX(end_time) FROM tasks WHERE end_time IS NOT NULL AND end_time <= ?',
+        (analysis_cutoff,),
+    )
     result = cursor.fetchone()
     conn.close()
     

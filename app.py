@@ -26,6 +26,7 @@ from processing import (
     get_failed_task_counts,
     get_summary_by_group,
     peek_log_type,
+    _to_datetime_mixed,
     LOG_TYPES,
     LOG_TYPE_MASS_INGESTION,
     LOG_TYPE_TASK_USAGE,
@@ -585,11 +586,11 @@ def display_status_analysis(df):
                 
                 # Parse End DateTime if available, otherwise fall back to Start Time
                 if 'End Time' in filtered_df_time.columns:
-                    filtered_df_time['End DateTime'] = pd.to_datetime(filtered_df_time['End Time'], errors='coerce', format='mixed', dayfirst=True)
+                    filtered_df_time['End DateTime'] = _to_datetime_mixed(filtered_df_time['End Time'])
                 elif 'Start DateTime' in filtered_df_time.columns:
-                    filtered_df_time['End DateTime'] = pd.to_datetime(filtered_df_time['Start DateTime'], errors='coerce', format='mixed', dayfirst=True)
+                    filtered_df_time['End DateTime'] = _to_datetime_mixed(filtered_df_time['Start DateTime'])
                 elif 'Start Time' in filtered_df_time.columns:
-                    filtered_df_time['End DateTime'] = pd.to_datetime(filtered_df_time['Start Time'], errors='coerce', format='mixed', dayfirst=True)
+                    filtered_df_time['End DateTime'] = _to_datetime_mixed(filtered_df_time['Start Time'])
                 else:
                     st.info("No End Time data available for hourly breakdown")
                     filtered_df_time = None
@@ -687,13 +688,13 @@ def display_time_series_analysis(df):
     # Prepare analysis timestamp (prefer End Time so tasks count on the day they finish)
     df_time = df_filtered.copy()
     if 'End Time' in df_time.columns:
-        df_time['End DateTime'] = pd.to_datetime(df_time['End Time'], errors='coerce', format='mixed', dayfirst=True)
+        df_time['End DateTime'] = _to_datetime_mixed(df_time['End Time'])
         ts_col = 'End DateTime'
     elif 'Start DateTime' in df_time.columns:
-        df_time['Start DateTime'] = pd.to_datetime(df_time['Start DateTime'], errors='coerce', format='mixed', dayfirst=True)
+        df_time['Start DateTime'] = _to_datetime_mixed(df_time['Start DateTime'])
         ts_col = 'Start DateTime'
     else:
-        df_time['Start DateTime'] = pd.to_datetime(df_time['Start Time'], errors='coerce', format='mixed', dayfirst=True)
+        df_time['Start DateTime'] = _to_datetime_mixed(df_time['Start Time'])
         ts_col = 'Start DateTime'
 
     df_time = df_time.dropna(subset=[ts_col])
@@ -889,13 +890,13 @@ def display_time_series_analysis(df):
         if 'End Time' in df_time.columns:
             df_duration = df_time.copy()
             # Ensure both start and end are datetimes
-            df_duration['End Time'] = pd.to_datetime(df_duration['End Time'], errors='coerce', format='mixed', dayfirst=True)
+            df_duration['End Time'] = _to_datetime_mixed(df_duration['End Time'])
             # Use the parsed Start DateTime column if available
             if 'Start DateTime' in df_duration.columns:
-                df_duration['Start DateTime'] = pd.to_datetime(df_duration['Start DateTime'], errors='coerce', format='mixed', dayfirst=True)
+                df_duration['Start DateTime'] = _to_datetime_mixed(df_duration['Start DateTime'])
                 start_col = 'Start DateTime'
             else:
-                df_duration['Start Time'] = pd.to_datetime(df_duration['Start Time'], errors='coerce', format='mixed', dayfirst=True)
+                df_duration['Start Time'] = _to_datetime_mixed(df_duration['Start Time'])
                 start_col = 'Start Time'
 
             # Only compute durations where both datetimes are present
@@ -1535,10 +1536,11 @@ def display_historical_analysis():
                 task = task_cur.merge(task_prev, on='task_name', how='outer').fillna(0)
                 if not task.empty:
                     task['run_delta'] = task['runs_curr'] - task['runs_prev']
-                    task['run_delta_abs'] = task['run_delta'].abs()
+                    task['ipus_delta'] = task['ipus_curr'] - task['ipus_prev']
+                    task['ipus_delta_abs'] = task['ipus_delta'].abs()
                     top_task = task.sort_values(
-                        ['run_delta_abs', 'runs_curr'],
-                        ascending=[False, False],
+                        ['ipus_delta_abs', 'run_delta', 'runs_curr'],
+                        ascending=[False, False, False],
                     ).head(3)
                     if not top_task.empty:
                         for _, row in top_task.iterrows():
@@ -1546,6 +1548,9 @@ def display_historical_analysis():
                             run_prev = int(row['runs_prev'])
                             run_curr = int(row['runs_curr'])
                             run_delta = run_curr - run_prev
+                            ipus_prev = float(row['ipus_prev'])
+                            ipus_curr = float(row['ipus_curr'])
+                            ipus_delta = ipus_curr - ipus_prev
 
                             if run_delta > 0:
                                 run_phrase = f"up {run_delta:+,} runs ({run_prev} → {run_curr})"
@@ -1563,6 +1568,7 @@ def display_historical_analysis():
                             tiny_note = " (tiny change)" if prev_rate == curr_rate and prev_ipu_per_run != curr_ipu_per_run else ""
 
                             lines.append(f"    - {task_name}: {run_phrase}")
+                            lines.append(f"      - IPUs: {ipus_prev:,.2f} → {ipus_curr:,.2f} ({ipus_delta:+,.2f})")
                             lines.append(f"      - IPU/run: {prev_rate} → {curr_rate}{tiny_note}")
 
                 lines.append("")
@@ -2866,7 +2872,7 @@ def display_historical_analysis():
                         start_date.isoformat(), analysis_end.isoformat(), org=org_param
                     )
                     if not daily_stats.empty:
-                        daily_stats['date'] = pd.to_datetime(daily_stats['date'], errors='coerce', format='mixed', dayfirst=True)
+                        daily_stats['date'] = _to_datetime_mixed(daily_stats['date'])
                         daily_stats = daily_stats.dropna(subset=['date']).sort_values('date')
                         st.line_chart(daily_stats.set_index('date')[[metric]], width='stretch')
 
@@ -2922,9 +2928,9 @@ def display_historical_analysis():
                         else:
                             raw_task_rows = _effective_metrics(raw_task_rows)
                             if 'end_time' in raw_task_rows.columns:
-                                raw_task_rows['task_date'] = pd.to_datetime(raw_task_rows['end_time'], errors='coerce', format='mixed', dayfirst=True).dt.date
+                                raw_task_rows['task_date'] = _to_datetime_mixed(raw_task_rows['end_time']).dt.date
                             elif 'start_time' in raw_task_rows.columns:
-                                raw_task_rows['task_date'] = pd.to_datetime(raw_task_rows['start_time'], errors='coerce', format='mixed', dayfirst=True).dt.date
+                                raw_task_rows['task_date'] = _to_datetime_mixed(raw_task_rows['start_time']).dt.date
                             else:
                                 raw_task_rows['task_date'] = pd.NaT
 

@@ -15,7 +15,28 @@ from mappings import get_org_name, mass_ingestion_org_name, is_mass_ingestion_or
 
 
 def _to_datetime_mixed(values):
-    return pd.to_datetime(values, errors='coerce', format='mixed', dayfirst=True)
+    parsed = pd.to_datetime(values, errors='coerce', format='mixed')
+
+    # ISO / year-first timestamps should stay month-first. Some legacy exports
+    # use day-first dates, so only reparse the non-year-first subset that way.
+    raw = pd.Series(values, copy=False).astype(str)
+    year_first_mask = raw.str.match(r'^\s*\d{4}[-/]')
+
+    if (~year_first_mask).any():
+        reparsed = pd.to_datetime(
+            raw.loc[~year_first_mask],
+            errors='coerce',
+            format='mixed',
+            dayfirst=True,
+        )
+        if isinstance(parsed, pd.Series):
+            parsed = parsed.copy()
+            parsed.loc[~year_first_mask] = reparsed
+        else:
+            parsed = pd.Series(parsed, index=raw.index)
+            parsed.loc[~year_first_mask] = reparsed
+
+    return parsed
 
 
 # Distinct logging sources that share the same historical pipeline
