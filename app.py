@@ -1187,7 +1187,6 @@ def display_save_run_section(df):
 
 def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=None):
     """Simple operational views for common IPU questions."""
-    today = datetime.now().date()
     default_month = analysis_end.replace(day=1)
 
     ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1, 1.4])
@@ -1225,7 +1224,7 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
     else:
         month_end_full = month_start.replace(month=month_start.month + 1, day=1) - timedelta(days=1)
 
-    month_end = min(month_end_full, analysis_end, today - timedelta(days=1))
+    month_end = min(month_end_full, max_date or analysis_end)
     if month_end < month_start:
         st.warning("No complete days in this month yet.")
         return
@@ -1274,7 +1273,21 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
 
     mtd_ipus = float(daily['total_ipus'].sum()) if not daily.empty else 0.0
     avg_daily = mtd_ipus / days_elapsed if days_elapsed else 0.0
-    projected = avg_daily * days_in_month
+
+    # Project remaining days from the recent daily rate (not MTD average).
+    # Early-month spikes would otherwise overstate month-end if we just scale MTD.
+    recent_window_days = 3
+    if not daily.empty:
+        daily_for_rate = daily.copy()
+        daily_for_rate['date'] = pd.to_datetime(daily_for_rate['date'], errors='coerce')
+        daily_for_rate = daily_for_rate.dropna(subset=['date']).sort_values('date')
+        recent_n = min(recent_window_days, len(daily_for_rate))
+        recent_avg = float(daily_for_rate.tail(recent_n)['total_ipus'].mean()) if recent_n else 0.0
+    else:
+        recent_n = 0
+        recent_avg = 0.0
+    days_remaining = max(days_in_month - days_elapsed, 0)
+    projected = mtd_ipus + recent_avg * days_remaining
     budget_pct = (mtd_ipus / monthly_budget * 100.0) if monthly_budget > 0 else None
     expected_pct = (days_elapsed / days_in_month * 100.0) if days_in_month else 0.0
 
@@ -1308,7 +1321,12 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
         else:
             st.metric("% of budget", "—")
     with m3:
-        st.metric("Projected month-end", f"{projected:,.1f}")
+        st.metric(
+            "Projected month-end",
+            f"{projected:,.1f}",
+            delta=f"recent {recent_n}d rate {recent_avg:,.1f}/day",
+            delta_color="off",
+        )
     with m4:
         st.metric(
             f"vs prior month (first {days_elapsed}d)",
@@ -1346,19 +1364,22 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
     chart_df.index.name = 'date'
     chart_df = chart_df.reset_index()
     chart_df['avg'] = avg_daily
+    chart_df['recent'] = recent_avg
 
     mean = float(chart_df['total_ipus'].mean()) if len(chart_df) else 0.0
     std = float(chart_df['total_ipus'].std(ddof=0)) if len(chart_df) else 0.0
     spike_cut = mean + max(std, mean * 0.25) if mean > 0 else 0.0
     chart_df['spike'] = chart_df['total_ipus'] >= spike_cut
 
-    plot_df = chart_df.set_index('date')[['total_ipus', 'avg']].rename(
-        columns={'total_ipus': 'IPUs', 'avg': 'Avg so far'}
+    plot_df = chart_df.set_index('date')[['total_ipus', 'avg', 'recent']].rename(
+        columns={'total_ipus': 'IPUs', 'avg': 'MTD avg', 'recent': 'Recent 3d rate'}
     )
     st.line_chart(plot_df, width='stretch', height=280)
 
     spike_days = chart_df[chart_df['spike']].sort_values('total_ipus', ascending=False)
     top_days = chart_df.sort_values('total_ipus', ascending=False).head(5)
+    # Every day in the month is selectable (newest first) — not only the hottest.
+    all_days = chart_df.sort_values('date', ascending=False)
 
     left, right = st.columns(2)
     with left:
@@ -1371,8 +1392,20 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
     with right:
         day_labels = [
             f"{r.date.strftime('%b %d')} — {r.total_ipus:,.1f} IPUs"
-            for r in top_days.itertuples()
+            for r in all_days.itertuples()
         ]
+        # Default to the hottest day when the widget first appears.
+        hottest_label = (
+            f"{top_days.iloc[0]['date'].strftime('%b %d')} — {top_days.iloc[0]['total_ipus']:,.1f} IPUs"
+            if not top_days.empty else None
+        )
+        default_index = day_labels.index(hottest_label) if hottest_label in day_labels else 0
+        if 'quick_answers_day' not in st.session_state and day_labels:
+            st.session_state.quick_answers_day = day_labels[default_index]
+        # Drop stale selection if month/focus changed and old label is gone.
+        if st.session_state.get('quick_answers_day') not in day_labels and day_labels:
+            st.session_state.quick_answers_day = day_labels[default_index]
+
         picked = st.selectbox(
             "Inspect day",
             options=day_labels if day_labels else ["(none)"],
@@ -1380,7 +1413,7 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
         )
         inspect_date = None
         if picked and picked != "(none)" and picked in day_labels:
-            inspect_date = top_days.iloc[day_labels.index(picked)]['date'].date()
+            inspect_date = all_days.iloc[day_labels.index(picked)]['date'].date()
 
     st.markdown("#### What's driving it")
     driver_scope = st.radio(
