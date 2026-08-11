@@ -1772,6 +1772,12 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
     st.markdown("#### What if we cut this?")
     cut_proj_frames = []
     cut_task_frames = []
+    cut_orgs_df = get_org_stats_by_date_range(
+        month_start.isoformat(), month_end.isoformat(), log_type=log_type
+    )
+    if scope_orgs is not None and not cut_orgs_df.empty:
+        cut_orgs_df = cut_orgs_df[cut_orgs_df['org'].isin(scope_orgs)]
+
     if scope_orgs is None or len(scope_orgs) <= 1:
         cut_proj_frames.append(
             get_project_stats_by_date_range(
@@ -1803,19 +1809,28 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
     cut_projects = _sum_driver_frames(cut_proj_frames, ['project_name'])
     cut_tasks = _sum_driver_frames(cut_task_frames, ['org', 'project_name', 'task_name'])
     if not cut_projects.empty:
-        cut_projects['project_name'] = cut_projects['project_name'].replace(
-            {'(No project)': '-', '': '-'}
-        ).fillna('-')
+        cut_projects['project_name'] = (
+            cut_projects['project_name']
+            .astype(str)
+            .replace({'nan': '-', 'None': '-', '(No project)': '-', '': '-'})
+            .fillna('-')
+        )
+        # "-" is not a real project (Mass Ingestion); cut those via Org or Task.
+        cut_projects = cut_projects[cut_projects['project_name'].astype(str).str.strip() != '-']
     if not cut_tasks.empty:
-        cut_tasks['project_name'] = cut_tasks['project_name'].replace(
-            {'(No project)': '-', '': '-'}
-        ).fillna('-')
+        cut_tasks['project_name'] = (
+            cut_tasks['project_name']
+            .astype(str)
+            .replace({'nan': '-', 'None': '-', '(No project)': '-', '': '-'})
+            .fillna('-')
+        )
 
     cut_type = st.radio(
         "Cut",
-        ["Project", "Task"],
+        ["Org", "Project", "Task"],
         horizontal=True,
         key="quick_answers_cut_type",
+        help="Mass Ingestion has no projects — use Org or Task for those.",
     )
 
     cut_org = None
@@ -1823,9 +1838,26 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
     cut_task = None
     cut_label = None
 
-    if cut_type == "Project":
-        if cut_projects.empty:
+    if cut_type == "Org":
+        if cut_orgs_df.empty:
             st.write("—")
+        else:
+            org_opts = cut_orgs_df.sort_values('total_ipus', ascending=False)
+            org_labels = [
+                f"{row.org} — {row.total_ipus:,.1f} IPUs MTD"
+                for row in org_opts.itertuples()
+            ]
+            picked_cut = st.selectbox(
+                "Org series to cut",
+                options=org_labels,
+                key="quick_answers_cut_org",
+            )
+            if picked_cut in org_labels:
+                cut_org = org_opts.iloc[org_labels.index(picked_cut)]['org']
+                cut_label = str(cut_org)
+    elif cut_type == "Project":
+        if cut_projects.empty:
+            st.write("No named projects in this focus (Mass Ingestion is cut via Org or Task).")
         else:
             proj_opts = cut_projects.sort_values('total_ipus', ascending=False).head(25)
             proj_labels = [
@@ -1846,7 +1878,11 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
         else:
             task_opts = cut_tasks.sort_values('total_ipus', ascending=False).head(25)
             task_labels = [
-                f"{row.org} / {row.project_name} / {row.task_name} — {row.total_ipus:,.1f} IPUs MTD"
+                (
+                    f"{row.org} / {row.task_name} — {row.total_ipus:,.1f} IPUs MTD"
+                    if str(row.project_name).strip() in ('-', '')
+                    else f"{row.org} / {row.project_name} / {row.task_name} — {row.total_ipus:,.1f} IPUs MTD"
+                )
                 for row in task_opts.itertuples()
             ]
             picked_cut = st.selectbox(
@@ -1859,10 +1895,20 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
                 cut_org = picked_row['org']
                 cut_project = picked_row['project_name']
                 cut_task = picked_row['task_name']
-                cut_label = f"{cut_org} / {cut_project} / {cut_task}"
+                if str(cut_project).strip() in ('-', ''):
+                    cut_label = f"{cut_org} / {cut_task}"
+                else:
+                    cut_label = f"{cut_org} / {cut_project} / {cut_task}"
 
     if cut_label:
-        if cut_type == "Project":
+        if cut_type == "Org":
+            item_daily = get_filtered_daily_stats_by_date_range(
+                month_start.isoformat(),
+                month_end.isoformat(),
+                org=cut_org,
+                log_type=log_type,
+            )
+        elif cut_type == "Project":
             item_daily = get_filtered_daily_stats_by_date_range(
                 month_start.isoformat(),
                 month_end.isoformat(),

@@ -1494,8 +1494,14 @@ def get_filtered_daily_stats_by_date_range(
         params.extend(list(orgs))
 
     if project_name is not None:
-        if project_name in ('-', '(No project)', ''):
-            query += " AND (project_name IS NULL OR TRIM(COALESCE(project_name, '')) = '')"
+        if str(project_name).strip() in ('-', '(No project)', ''):
+            query += (
+                " AND ("
+                "project_name IS NULL OR TRIM(COALESCE(project_name, '')) = '' "
+                "OR TRIM(COALESCE(project_name, '')) = '-' "
+                "OR TRIM(COALESCE(project_name, '')) = '(No project)'"
+                ")"
+            )
         else:
             query += ' AND project_name = ?'
             params.append(project_name)
