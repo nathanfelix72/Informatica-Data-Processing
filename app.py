@@ -18,6 +18,7 @@ import pandas as pd
 import numpy as np
 import io
 from datetime import datetime, timezone, timedelta
+import math
 from pathlib import Path
 
 from processing import (
@@ -73,6 +74,7 @@ from reports import (
     get_task_spikes_for_period,
     get_task_name_stats_by_date_range,
     get_org_daily_stats_by_date_range,
+    get_filtered_daily_stats_by_date_range,
 )
 
 
@@ -173,6 +175,20 @@ def display_sidebar():
     )
     st.session_state.cost_per_ipu = cost_per_ipu
     set_cost_per_ipu_month(cost_per_ipu)
+
+    if 'monthly_ipu_budget' not in st.session_state:
+        # Keep any value previously set in Quick Answers.
+        st.session_state.monthly_ipu_budget = float(
+            st.session_state.get('quick_answers_budget', 0.0) or 0.0
+        )
+    monthly_budget = st.sidebar.number_input(
+        "Monthly IPU budget",
+        min_value=0.0,
+        step=100.0,
+        key="monthly_ipu_budget",
+        help="Used in Quick Answers for %% of budget and projected budget-hit date.",
+    )
+    st.session_state.quick_answers_budget = monthly_budget
     
     st.sidebar.markdown("---")
 
@@ -1189,7 +1205,7 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
     """Simple operational views for common IPU questions."""
     default_month = analysis_end.replace(day=1)
 
-    ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1, 1.4])
+    ctrl1, ctrl2 = st.columns([1.2, 1.4])
     with ctrl1:
         month_options = []
         cursor = (max_date or analysis_end).replace(day=1)
@@ -1208,15 +1224,6 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
             index=month_options.index(default_month) if default_month in month_options else 0,
             key="quick_answers_month",
         )
-    with ctrl2:
-        if 'quick_answers_budget' not in st.session_state:
-            st.session_state.quick_answers_budget = 0.0
-        monthly_budget = st.number_input(
-            "Monthly IPU budget",
-            min_value=0.0,
-            step=100.0,
-            key="quick_answers_budget",
-        )
 
     month_start = selected_month
     if month_start.month == 12:
@@ -1231,6 +1238,7 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
 
     days_in_month = month_end_full.day
     days_elapsed = (month_end - month_start).days + 1
+    monthly_budget = float(st.session_state.get('monthly_ipu_budget', 0.0) or 0.0)
 
     org_stats_all = get_org_stats_by_date_range(
         month_start.isoformat(), month_end.isoformat(), log_type=log_type
@@ -1240,7 +1248,7 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
         if not org_stats_all.empty else []
     )
     focus_options = get_focus_options(available)
-    with ctrl3:
+    with ctrl2:
         org_filter = st.selectbox(
             "Focus",
             options=focus_options,
@@ -1291,6 +1299,32 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
     budget_pct = (mtd_ipus / monthly_budget * 100.0) if monthly_budget > 0 else None
     expected_pct = (days_elapsed / days_in_month * 100.0) if days_in_month else 0.0
 
+    # When the monthly budget is projected to be hit (recent rate for remaining).
+    budget_hit_value = "—"
+    budget_hit_delta = None
+    if monthly_budget > 0:
+        if not daily.empty and recent_n:
+            day_cum = daily_for_rate.copy()
+            day_cum['cum'] = day_cum['total_ipus'].cumsum()
+            crossed = day_cum[day_cum['cum'] >= monthly_budget]
+            if not crossed.empty:
+                hit = pd.to_datetime(crossed.iloc[0]['date']).date()
+                budget_hit_value = hit.strftime('%b %d')
+                budget_hit_delta = "already reached"
+            elif recent_avg <= 0:
+                budget_hit_value = "Not at current rate"
+            else:
+                days_needed = int(math.ceil((monthly_budget - mtd_ipus) / recent_avg))
+                hit_date = month_end + timedelta(days=days_needed)
+                if hit_date > month_end_full:
+                    budget_hit_value = "After month-end"
+                    budget_hit_delta = hit_date.strftime('%b %d proj.')
+                else:
+                    budget_hit_value = hit_date.strftime('%b %d')
+                    budget_hit_delta = f"in {days_needed}d at recent rate"
+        elif recent_avg <= 0:
+            budget_hit_value = "Not at current rate"
+
     # Prior month same span for comparison
     prev_month_end = month_start - timedelta(days=1)
     prev_month_start = prev_month_end.replace(day=1)
@@ -1307,7 +1341,7 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
         prev_mtd = float(prev_scoped['total_ipus'].sum())
     delta_vs_prev = mtd_ipus - prev_mtd
 
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     with m1:
         st.metric("Month-to-date IPUs", f"{mtd_ipus:,.1f}")
     with m2:
@@ -1319,7 +1353,7 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
                 delta_color="inverse",
             )
         else:
-            st.metric("% of budget", "—")
+            st.metric("% of budget", "—", delta="set budget in sidebar", delta_color="off")
     with m3:
         st.metric(
             "Projected month-end",
@@ -1328,6 +1362,11 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
             delta_color="off",
         )
     with m4:
+        if budget_hit_delta:
+            st.metric("Budget hit", budget_hit_value, delta=budget_hit_delta, delta_color="off")
+        else:
+            st.metric("Budget hit", budget_hit_value)
+    with m5:
         st.metric(
             f"vs prior month (first {days_elapsed}d)",
             f"{mtd_ipus:,.1f}",
@@ -1405,6 +1444,38 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
     chart_df = chart_df.reset_index()
     chart_df['avg'] = avg_daily
     chart_df['recent'] = recent_avg
+    chart_df['day_num'] = chart_df['date'].dt.day
+    if monthly_budget > 0 and days_in_month > 0:
+        chart_df['budget_pace'] = monthly_budget / days_in_month
+    else:
+        chart_df['budget_pace'] = pd.NA
+
+    # Same day-of-month from prior month (Aug 7 ↔ Jul 7), scoped like this month.
+    prev_align_end = min(
+        prev_month_end,
+        prev_month_start + timedelta(days=days_elapsed - 1),
+    )
+    prev_align_org_daily = get_org_daily_stats_by_date_range(
+        prev_month_start.isoformat(), prev_align_end.isoformat(), log_type=log_type
+    )
+    if prev_align_org_daily.empty:
+        prev_align_daily = pd.DataFrame(columns=['day_num', 'total_ipus_prev'])
+    else:
+        prev_scoped_align = prev_align_org_daily.copy()
+        if scope_orgs is not None:
+            prev_scoped_align = prev_scoped_align[prev_scoped_align['org'].isin(scope_orgs)]
+        prev_align_daily = (
+            prev_scoped_align.groupby('date', as_index=False)['total_ipus']
+            .sum()
+        )
+        prev_align_daily['date'] = pd.to_datetime(prev_align_daily['date'], errors='coerce')
+        prev_align_daily = prev_align_daily.dropna(subset=['date'])
+        prev_align_daily['day_num'] = prev_align_daily['date'].dt.day
+        prev_align_daily = prev_align_daily.groupby('day_num', as_index=False)['total_ipus'].sum()
+        prev_align_daily = prev_align_daily.rename(columns={'total_ipus': 'total_ipus_prev'})
+
+    chart_df = chart_df.merge(prev_align_daily, on='day_num', how='left')
+    chart_df['total_ipus_prev'] = chart_df['total_ipus_prev'].fillna(0.0)
 
     mean = float(chart_df['total_ipus'].mean()) if len(chart_df) else 0.0
     std = float(chart_df['total_ipus'].std(ddof=0)) if len(chart_df) else 0.0
@@ -1412,12 +1483,94 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
     chart_df['spike'] = chart_df['total_ipus'] >= spike_cut
 
     # Date-only labels so the axis shows days, not 12:00 PM timestamps.
-    plot_df = chart_df[['date', 'total_ipus', 'avg', 'recent']].copy()
+    plot_cols = {
+        'total_ipus': 'This month',
+        'total_ipus_prev': 'Last month (same day)',
+        'recent': 'Recent 3d rate',
+    }
+    if monthly_budget > 0:
+        plot_cols['budget_pace'] = 'Budget pace'
+    plot_df = chart_df[['date'] + list(plot_cols.keys())].copy()
     plot_df['Day'] = plot_df['date'].dt.strftime('%b %d')
-    plot_df = plot_df.set_index('Day')[['total_ipus', 'avg', 'recent']].rename(
-        columns={'total_ipus': 'IPUs', 'avg': 'MTD avg', 'recent': 'Recent 3d rate'}
+    plot_df = plot_df.set_index('Day')[list(plot_cols.keys())].rename(columns=plot_cols)
+    st.line_chart(plot_df, width='stretch', height=300)
+
+    # --- Log type mix (Task Usage vs Mass Ingestion), always both sides ---
+    st.markdown("#### Task Usage vs Mass Ingestion")
+    tu_orgs = get_org_stats_by_date_range(
+        month_start.isoformat(), month_end.isoformat(), log_type=LOG_TYPE_TASK_USAGE
     )
-    st.line_chart(plot_df, width='stretch', height=280)
+    mi_orgs = get_org_stats_by_date_range(
+        month_start.isoformat(), month_end.isoformat(), log_type=LOG_TYPE_MASS_INGESTION
+    )
+    if scope_orgs is not None:
+        if not tu_orgs.empty:
+            tu_orgs = tu_orgs[tu_orgs['org'].isin(scope_orgs)]
+        if not mi_orgs.empty:
+            mi_orgs = mi_orgs[mi_orgs['org'].isin(scope_orgs)]
+
+    tu_total = float(tu_orgs['total_ipus'].sum()) if not tu_orgs.empty else 0.0
+    mi_total = float(mi_orgs['total_ipus'].sum()) if not mi_orgs.empty else 0.0
+    mix_total = tu_total + mi_total
+    mix1, mix2, mix3 = st.columns(3)
+    with mix1:
+        st.metric(
+            "Task Usage",
+            f"{tu_total:,.1f} IPUs",
+            delta=f"{(tu_total / mix_total * 100) if mix_total else 0:.1f}% of month",
+            delta_color="off",
+        )
+    with mix2:
+        st.metric(
+            "Mass Ingestion",
+            f"{mi_total:,.1f} IPUs",
+            delta=f"{(mi_total / mix_total * 100) if mix_total else 0:.1f}% of month",
+            delta_color="off",
+        )
+    with mix3:
+        st.metric("Combined", f"{mix_total:,.1f} IPUs")
+
+    def _mix_by_dimension(frame, dim_fn, dim_name):
+        if frame is None or frame.empty:
+            out = pd.DataFrame(columns=[dim_name, 'total_ipus'])
+        else:
+            tmp = frame.copy()
+            tmp[dim_name] = tmp['org'].map(dim_fn)
+            out = tmp.groupby(dim_name, as_index=False)['total_ipus'].sum()
+        return out
+
+    tu_family = _mix_by_dimension(tu_orgs, base_org_name, 'family')
+    mi_family = _mix_by_dimension(mi_orgs, base_org_name, 'family')
+    mix_family = tu_family.merge(
+        mi_family, on='family', how='outer', suffixes=('_tu', '_mi')
+    ).fillna(0.0)
+    if not mix_family.empty:
+        mix_family['parent'] = mix_family['family'].map(parent_org_name)
+        mix_family['total'] = mix_family['total_ipus_tu'] + mix_family['total_ipus_mi']
+        mix_family['TU %'] = (
+            mix_family['total_ipus_tu'] / mix_family['total'].replace(0, pd.NA) * 100
+        ).fillna(0.0).round(1)
+        mix_family['MI %'] = (
+            mix_family['total_ipus_mi'] / mix_family['total'].replace(0, pd.NA) * 100
+        ).fillna(0.0).round(1)
+        mix_family['total_ipus_tu'] = mix_family['total_ipus_tu'].round(2)
+        mix_family['total_ipus_mi'] = mix_family['total_ipus_mi'].round(2)
+        mix_family['total'] = mix_family['total'].round(2)
+        mix_family = mix_family.sort_values('total', ascending=False)
+        mix_family = mix_family.rename(columns={
+            'parent': 'Parent',
+            'family': 'Org',
+            'total_ipus_tu': 'Task Usage',
+            'total_ipus_mi': 'Mass Ingestion',
+            'total': 'Total',
+        })
+        st.dataframe(
+            mix_family[['Parent', 'Org', 'Task Usage', 'Mass Ingestion', 'Total', 'TU %', 'MI %']],
+            width='stretch',
+            hide_index=True,
+        )
+    else:
+        st.write("—")
 
     spike_days = chart_df[chart_df['spike']].sort_values('total_ipus', ascending=False)
     top_days = chart_df.sort_values('total_ipus', ascending=False).head(5)
@@ -1574,11 +1727,17 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
             st.write("—")
         elif task_drivers.empty:
             show = proj_drivers.head(15)[['project_name', 'total_ipus']].copy()
+            show['project_name'] = show['project_name'].replace(
+                {'(No project)': '-', '': '-'}
+            ).fillna('-')
             show['total_ipus'] = show['total_ipus'].round(2)
             show = show.rename(columns={'project_name': 'Project', 'total_ipus': 'IPUs'})
             st.dataframe(show, width='stretch', hide_index=True)
         else:
             show = task_drivers.copy()
+            show['project_name'] = show['project_name'].replace(
+                {'(No project)': '-', '': '-'}
+            ).fillna('-')
             if not proj_drivers.empty:
                 proj_totals = proj_drivers.set_index('project_name')['total_ipus']
                 show['project_total'] = show['project_name'].map(proj_totals)
@@ -1608,6 +1767,179 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
                 width='stretch',
                 hide_index=True,
             )
+
+    # --- What if we cut this? ---
+    st.markdown("#### What if we cut this?")
+    cut_proj_frames = []
+    cut_task_frames = []
+    if scope_orgs is None or len(scope_orgs) <= 1:
+        cut_proj_frames.append(
+            get_project_stats_by_date_range(
+                month_start.isoformat(), month_end.isoformat(),
+                org=selected_org, log_type=log_type,
+            )
+        )
+        cut_task_frames.append(
+            get_task_name_stats_by_date_range(
+                month_start.isoformat(), month_end.isoformat(),
+                org=selected_org, log_type=log_type, limit=40,
+            )
+        )
+    else:
+        for o in scope_orgs:
+            cut_proj_frames.append(
+                get_project_stats_by_date_range(
+                    month_start.isoformat(), month_end.isoformat(),
+                    org=o, log_type=log_type,
+                )
+            )
+            cut_task_frames.append(
+                get_task_name_stats_by_date_range(
+                    month_start.isoformat(), month_end.isoformat(),
+                    org=o, log_type=log_type, limit=40,
+                )
+            )
+
+    cut_projects = _sum_driver_frames(cut_proj_frames, ['project_name'])
+    cut_tasks = _sum_driver_frames(cut_task_frames, ['org', 'project_name', 'task_name'])
+    if not cut_projects.empty:
+        cut_projects['project_name'] = cut_projects['project_name'].replace(
+            {'(No project)': '-', '': '-'}
+        ).fillna('-')
+    if not cut_tasks.empty:
+        cut_tasks['project_name'] = cut_tasks['project_name'].replace(
+            {'(No project)': '-', '': '-'}
+        ).fillna('-')
+
+    cut_type = st.radio(
+        "Cut",
+        ["Project", "Task"],
+        horizontal=True,
+        key="quick_answers_cut_type",
+    )
+
+    cut_org = None
+    cut_project = None
+    cut_task = None
+    cut_label = None
+
+    if cut_type == "Project":
+        if cut_projects.empty:
+            st.write("—")
+        else:
+            proj_opts = cut_projects.sort_values('total_ipus', ascending=False).head(25)
+            proj_labels = [
+                f"{row.project_name} — {row.total_ipus:,.1f} IPUs MTD"
+                for row in proj_opts.itertuples()
+            ]
+            picked_cut = st.selectbox(
+                "Project to cut",
+                options=proj_labels,
+                key="quick_answers_cut_project",
+            )
+            if picked_cut in proj_labels:
+                cut_project = proj_opts.iloc[proj_labels.index(picked_cut)]['project_name']
+                cut_label = str(cut_project)
+    else:
+        if cut_tasks.empty:
+            st.write("—")
+        else:
+            task_opts = cut_tasks.sort_values('total_ipus', ascending=False).head(25)
+            task_labels = [
+                f"{row.org} / {row.project_name} / {row.task_name} — {row.total_ipus:,.1f} IPUs MTD"
+                for row in task_opts.itertuples()
+            ]
+            picked_cut = st.selectbox(
+                "Task to cut",
+                options=task_labels,
+                key="quick_answers_cut_task",
+            )
+            if picked_cut in task_labels:
+                picked_row = task_opts.iloc[task_labels.index(picked_cut)]
+                cut_org = picked_row['org']
+                cut_project = picked_row['project_name']
+                cut_task = picked_row['task_name']
+                cut_label = f"{cut_org} / {cut_project} / {cut_task}"
+
+    if cut_label:
+        if cut_type == "Project":
+            item_daily = get_filtered_daily_stats_by_date_range(
+                month_start.isoformat(),
+                month_end.isoformat(),
+                orgs=scope_orgs,
+                project_name=cut_project,
+                log_type=log_type,
+            )
+        else:
+            item_daily = get_filtered_daily_stats_by_date_range(
+                month_start.isoformat(),
+                month_end.isoformat(),
+                org=cut_org,
+                project_name=cut_project,
+                task_name=cut_task,
+                log_type=log_type,
+            )
+
+        item_mtd = float(item_daily['total_ipus'].sum()) if not item_daily.empty else 0.0
+        if not item_daily.empty:
+            item_sorted = item_daily.copy()
+            item_sorted['date'] = pd.to_datetime(item_sorted['date'], errors='coerce')
+            item_sorted = item_sorted.dropna(subset=['date']).sort_values('date')
+            item_recent_n = min(3, len(item_sorted))
+            item_recent_avg = float(item_sorted.tail(item_recent_n)['total_ipus'].mean())
+        else:
+            item_recent_n = 0
+            item_recent_avg = 0.0
+
+        remaining_saved = item_recent_avg * days_remaining
+        # MTD already spent still counts; only future burn of this item is removed.
+        new_projected = mtd_ipus + max(recent_avg - item_recent_avg, 0.0) * days_remaining
+
+        new_budget_hit = "—"
+        new_budget_delta = None
+        if monthly_budget <= 0:
+            new_budget_hit = "—"
+            new_budget_delta = "set budget in sidebar"
+        elif mtd_ipus >= monthly_budget:
+            new_budget_hit = budget_hit_value
+            new_budget_delta = "already reached (MTD spent)"
+        else:
+            new_recent = max(recent_avg - item_recent_avg, 0.0)
+            if new_recent <= 0:
+                new_budget_hit = "Not at cut rate"
+                new_budget_delta = "usage would stall"
+            else:
+                days_needed = int(math.ceil((monthly_budget - mtd_ipus) / new_recent))
+                hit_date = month_end + timedelta(days=days_needed)
+                if hit_date > month_end_full:
+                    new_budget_hit = "After month-end"
+                    new_budget_delta = hit_date.strftime('%b %d proj.')
+                else:
+                    new_budget_hit = hit_date.strftime('%b %d')
+                    new_budget_delta = f"in {days_needed}d after cut"
+
+        w1, w2, w3, w4 = st.columns(4)
+        with w1:
+            st.metric(f"{cut_type} MTD", f"{item_mtd:,.1f} IPUs")
+        with w2:
+            st.metric(
+                "Est. remaining saved",
+                f"{remaining_saved:,.1f} IPUs",
+                delta=f"recent {item_recent_n}d × {days_remaining}d left",
+                delta_color="off",
+            )
+        with w3:
+            st.metric(
+                "New projected month-end",
+                f"{new_projected:,.1f}",
+                delta=f"{new_projected - projected:+,.1f} vs current proj.",
+                delta_color="inverse",
+            )
+        with w4:
+            if new_budget_delta:
+                st.metric("New budget hit", new_budget_hit, delta=new_budget_delta, delta_color="off")
+            else:
+                st.metric("New budget hit", new_budget_hit)
 
     if not spike_days.empty and driver_scope == "Whole month":
         st.markdown("#### Spike days vs normal")

@@ -1439,7 +1439,7 @@ def get_task_name_stats_by_date_range(start_date: str, end_date: str,
     query = (
         "SELECT "
         "COALESCE(NULLIF(TRIM(org), ''), 'Unknown') AS org, "
-        "COALESCE(NULLIF(TRIM(project_name), ''), '(No project)') AS project_name, "
+        "COALESCE(NULLIF(TRIM(project_name), ''), '-') AS project_name, "
         "COALESCE(NULLIF(TRIM(task_name), ''), '(Unnamed)') AS task_name, "
         "COUNT(*) AS task_count, "
         "COALESCE(SUM(" + ipu_expr + "), 0) AS total_ipus, "
@@ -1458,6 +1458,58 @@ def get_task_name_stats_by_date_range(start_date: str, end_date: str,
     task_stats = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return task_stats
+
+
+def get_filtered_daily_stats_by_date_range(
+    start_date: str,
+    end_date: str,
+    org: str = None,
+    orgs: list | None = None,
+    project_name: str = None,
+    task_name: str = None,
+    log_type: str = None,
+) -> pd.DataFrame:
+    """Daily IPUs for an optional org/project/task slice (for what-if cut estimates)."""
+    init_database()
+    conn = sqlite3.connect(DB_PATH)
+
+    ipu_expr, ipu_params = _effective_ipu_sql()
+    cost_expr, cost_params = _effective_cost_sql()
+
+    query = (
+        "SELECT DATE(end_time) AS date, "
+        "COUNT(*) AS task_count, "
+        "COALESCE(SUM(" + ipu_expr + "), 0) AS total_ipus, "
+        "COALESCE(SUM(" + cost_expr + "), 0) AS total_cost "
+        "FROM tasks WHERE end_time >= ? AND end_time <= ?"
+    )
+    params = ipu_params + cost_params + [f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+
+    if org:
+        query += ' AND org = ?'
+        params.append(org)
+    elif orgs:
+        placeholders = ','.join('?' * len(orgs))
+        query += f' AND org IN ({placeholders})'
+        params.extend(list(orgs))
+
+    if project_name is not None:
+        if project_name in ('-', '(No project)', ''):
+            query += " AND (project_name IS NULL OR TRIM(COALESCE(project_name, '')) = '')"
+        else:
+            query += ' AND project_name = ?'
+            params.append(project_name)
+
+    if task_name is not None:
+        query += ' AND task_name = ?'
+        params.append(task_name)
+
+    query, params = _append_log_type_filter(query, params, log_type)
+    query += ' GROUP BY DATE(end_time) ORDER BY DATE(end_time)'
+
+    daily = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return daily
 
 
 def _normalize_environment_base(name) -> str:
