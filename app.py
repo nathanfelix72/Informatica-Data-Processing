@@ -1335,21 +1335,61 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
             delta_color="inverse",
         )
 
-    # Parent organization split (CES-Prod vs CES-Sandbox)
-    if not org_stats_all.empty and org_filter == "All orgs":
-        parent_roll = org_stats_all.copy()
-        parent_roll['parent'] = parent_roll['org'].map(parent_org_name)
+    # Parent + sub-org rollups (CES-Prod / CES-Sandbox and their children)
+    if not org_stats_all.empty and (
+        org_filter == "All orgs" or org_filter in PARENT_ORG_CHILDREN
+    ):
+        roll = org_stats_all.copy()
+        if org_filter in PARENT_ORG_CHILDREN:
+            roll = roll[roll['org'].map(parent_org_name) == org_filter]
+        roll['parent'] = roll['org'].map(parent_org_name)
+        roll['family'] = roll['org'].map(base_org_name)
+
         parent_sum = (
-            parent_roll.groupby('parent', as_index=False)['total_ipus']
+            roll.groupby('parent', as_index=False)['total_ipus']
             .sum()
             .sort_values('total_ipus', ascending=False)
         )
-        parent_total = float(parent_sum['total_ipus'].sum()) or 1.0
-        pcols = st.columns(max(len(parent_sum), 1))
-        for idx, row in enumerate(parent_sum.itertuples()):
-            with pcols[idx]:
-                pct = float(row.total_ipus) / parent_total * 100.0
-                st.metric(str(row.parent), f"{row.total_ipus:,.1f} IPUs", delta=f"{pct:.1f}% of total")
+        family_sum = (
+            roll.groupby(['parent', 'family'], as_index=False)['total_ipus']
+            .sum()
+            .sort_values('total_ipus', ascending=False)
+        )
+        grand_total = float(roll['total_ipus'].sum()) or 1.0
+
+        if org_filter == "All orgs" and not parent_sum.empty:
+            pcols = st.columns(max(len(parent_sum), 1))
+            for idx, row in enumerate(parent_sum.itertuples()):
+                with pcols[idx]:
+                    pct = float(row.total_ipus) / grand_total * 100.0
+                    st.metric(
+                        str(row.parent),
+                        f"{row.total_ipus:,.1f} IPUs",
+                        delta=f"{pct:.1f}% of total",
+                    )
+
+        # Sub-orgs: TU + MI combined per family, same metric style as parents
+        parents_to_show = (
+            [org_filter] if org_filter in PARENT_ORG_CHILDREN
+            else parent_sum['parent'].tolist()
+        )
+        for parent in parents_to_show:
+            kids = family_sum[family_sum['parent'] == parent]
+            if kids.empty:
+                continue
+            if org_filter == "All orgs":
+                st.caption(parent)
+            parent_total = float(kids['total_ipus'].sum()) or 1.0
+            kcols = st.columns(max(len(kids), 1))
+            for idx, row in enumerate(kids.itertuples()):
+                with kcols[idx]:
+                    pct_total = float(row.total_ipus) / grand_total * 100.0
+                    pct_parent = float(row.total_ipus) / parent_total * 100.0
+                    st.metric(
+                        str(row.family),
+                        f"{row.total_ipus:,.1f} IPUs",
+                        delta=f"{pct_total:.1f}% total · {pct_parent:.1f}% of {parent}",
+                    )
 
     st.markdown("#### Day by day")
     if daily.empty:
@@ -1371,7 +1411,10 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
     spike_cut = mean + max(std, mean * 0.25) if mean > 0 else 0.0
     chart_df['spike'] = chart_df['total_ipus'] >= spike_cut
 
-    plot_df = chart_df.set_index('date')[['total_ipus', 'avg', 'recent']].rename(
+    # Date-only labels so the axis shows days, not 12:00 PM timestamps.
+    plot_df = chart_df[['date', 'total_ipus', 'avg', 'recent']].copy()
+    plot_df['Day'] = plot_df['date'].dt.strftime('%b %d')
+    plot_df = plot_df.set_index('Day')[['total_ipus', 'avg', 'recent']].rename(
         columns={'total_ipus': 'IPUs', 'avg': 'MTD avg', 'recent': 'Recent 3d rate'}
     )
     st.line_chart(plot_df, width='stretch', height=280)
@@ -1394,95 +1437,109 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
             f"{r.date.strftime('%b %d')} — {r.total_ipus:,.1f} IPUs"
             for r in all_days.itertuples()
         ]
-        # Default to the hottest day when the widget first appears.
+        label_to_date = {
+            f"{r.date.strftime('%b %d')} — {r.total_ipus:,.1f} IPUs": r.date.date()
+            for r in all_days.itertuples()
+        }
         hottest_label = (
             f"{top_days.iloc[0]['date'].strftime('%b %d')} — {top_days.iloc[0]['total_ipus']:,.1f} IPUs"
             if not top_days.empty else None
         )
-        default_index = day_labels.index(hottest_label) if hottest_label in day_labels else 0
-        if 'quick_answers_day' not in st.session_state and day_labels:
-            st.session_state.quick_answers_day = day_labels[default_index]
-        # Drop stale selection if month/focus changed and old label is gone.
-        if st.session_state.get('quick_answers_day') not in day_labels and day_labels:
-            st.session_state.quick_answers_day = day_labels[default_index]
+        default_days = [hottest_label] if hottest_label in day_labels else (day_labels[:1] if day_labels else [])
 
-        picked = st.selectbox(
-            "Inspect day",
-            options=day_labels if day_labels else ["(none)"],
-            key="quick_answers_day",
+        # New multiselect key; scrub labels that no longer exist after month/focus change.
+        prev = st.session_state.get('quick_answers_days')
+        if not isinstance(prev, list):
+            st.session_state.quick_answers_days = default_days
+        elif any(label not in day_labels for label in prev):
+            kept = [label for label in prev if label in day_labels]
+            st.session_state.quick_answers_days = kept if kept else default_days
+
+        picked_days = st.multiselect(
+            "Inspect days",
+            options=day_labels,
+            key="quick_answers_days",
         )
-        inspect_date = None
-        if picked and picked != "(none)" and picked in day_labels:
-            inspect_date = all_days.iloc[day_labels.index(picked)]['date'].date()
+        inspect_dates = [
+            label_to_date[label]
+            for label in picked_days
+            if label in label_to_date
+        ]
 
     st.markdown("#### What's driving it")
+    if st.session_state.get('quick_answers_driver_scope') == 'Selected day':
+        st.session_state.quick_answers_driver_scope = 'Selected days'
     driver_scope = st.radio(
         "Drivers for",
-        ["Whole month", "Selected day"],
+        ["Whole month", "Selected days"],
         horizontal=True,
         key="quick_answers_driver_scope",
     )
 
-    if driver_scope == "Selected day" and inspect_date is not None:
-        d_start = inspect_date.isoformat()
-        d_end = inspect_date.isoformat()
-    else:
-        d_start = month_start.isoformat()
-        d_end = month_end.isoformat()
+    def _sum_driver_frames(frames, group_cols):
+        valid = [f for f in frames if f is not None and not f.empty]
+        if not valid:
+            return pd.DataFrame()
+        combined = pd.concat(valid, ignore_index=True)
+        agg = {
+            'task_count': 'sum',
+            'total_ipus': 'sum',
+            'total_cost': 'sum',
+        }
+        present = {k: v for k, v in agg.items() if k in combined.columns}
+        return (
+            combined.groupby(group_cols, as_index=False)
+            .agg(present)
+            .sort_values('total_ipus', ascending=False)
+        )
 
-    org_drivers = get_org_stats_by_date_range(d_start, d_end, log_type=log_type)
-    if scope_orgs is not None and not org_drivers.empty:
-        org_drivers = org_drivers[org_drivers['org'].isin(scope_orgs)]
-
-    if scope_orgs is None or len(scope_orgs) <= 1:
-        proj_drivers = get_project_stats_by_date_range(
-            d_start, d_end, org=selected_org, log_type=log_type
-        )
-        task_drivers = get_task_name_stats_by_date_range(
-            d_start, d_end, org=selected_org, log_type=log_type, limit=15
-        )
+    if driver_scope == "Selected days" and inspect_dates:
+        day_ranges = [(d.isoformat(), d.isoformat()) for d in sorted(inspect_dates)]
     else:
-        proj_frames = [
-            get_project_stats_by_date_range(d_start, d_end, org=o, log_type=log_type)
-            for o in scope_orgs
-        ]
-        proj_drivers = (
-            pd.concat([f for f in proj_frames if f is not None and not f.empty], ignore_index=True)
-            if any(f is not None and not f.empty for f in proj_frames) else pd.DataFrame()
-        )
-        if not proj_drivers.empty:
-            proj_drivers = (
-                proj_drivers.groupby('project_name', as_index=False)
-                .agg(
-                    task_count=('task_count', 'sum'),
-                    total_ipus=('total_ipus', 'sum'),
-                    total_cost=('total_cost', 'sum'),
+        day_ranges = [(month_start.isoformat(), month_end.isoformat())]
+
+    org_frames = []
+    proj_frames = []
+    task_frames = []
+    for d_start, d_end in day_ranges:
+        org_part = get_org_stats_by_date_range(d_start, d_end, log_type=log_type)
+        if scope_orgs is not None and not org_part.empty:
+            org_part = org_part[org_part['org'].isin(scope_orgs)]
+        org_frames.append(org_part)
+
+        if scope_orgs is None or len(scope_orgs) <= 1:
+            proj_frames.append(
+                get_project_stats_by_date_range(
+                    d_start, d_end, org=selected_org, log_type=log_type
                 )
-                .sort_values('total_ipus', ascending=False)
             )
-        task_frames = [
-            get_task_name_stats_by_date_range(d_start, d_end, org=o, log_type=log_type, limit=15)
-            for o in scope_orgs
-        ]
-        task_drivers = (
-            pd.concat([f for f in task_frames if f is not None and not f.empty], ignore_index=True)
-            if any(f is not None and not f.empty for f in task_frames) else pd.DataFrame()
-        )
-        if not task_drivers.empty:
-            task_drivers = (
-                task_drivers.groupby(['org', 'project_name', 'task_name'], as_index=False)
-                .agg(
-                    task_count=('task_count', 'sum'),
-                    total_ipus=('total_ipus', 'sum'),
-                    total_cost=('total_cost', 'sum'),
+            task_frames.append(
+                get_task_name_stats_by_date_range(
+                    d_start, d_end, org=selected_org, log_type=log_type, limit=30
                 )
-                .sort_values('total_ipus', ascending=False)
-                .head(15)
             )
+        else:
+            for o in scope_orgs:
+                proj_frames.append(
+                    get_project_stats_by_date_range(
+                        d_start, d_end, org=o, log_type=log_type
+                    )
+                )
+                task_frames.append(
+                    get_task_name_stats_by_date_range(
+                        d_start, d_end, org=o, log_type=log_type, limit=30
+                    )
+                )
+
+    org_drivers = _sum_driver_frames(org_frames, ['org'])
+    proj_drivers = _sum_driver_frames(proj_frames, ['project_name'])
+    task_drivers = _sum_driver_frames(task_frames, ['org', 'project_name', 'task_name'])
+    if not task_drivers.empty:
+        task_drivers = task_drivers.head(40)
 
     total_for_pct = float(org_drivers['total_ipus'].sum()) if not org_drivers.empty else 0.0
 
-    c1, c2, c3 = st.columns([1.4, 1, 1.2])
+    c1, c2 = st.columns([1.1, 1.4])
     with c1:
         st.caption("Orgs")
         if org_drivers.empty:
@@ -1512,23 +1569,45 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
                 hide_index=True,
             )
     with c2:
-        st.caption("Projects")
-        if proj_drivers.empty:
+        st.caption("Projects & tasks")
+        if task_drivers.empty and proj_drivers.empty:
             st.write("—")
-        else:
-            show = proj_drivers.head(10)[['project_name', 'total_ipus']].copy()
+        elif task_drivers.empty:
+            show = proj_drivers.head(15)[['project_name', 'total_ipus']].copy()
             show['total_ipus'] = show['total_ipus'].round(2)
             show = show.rename(columns={'project_name': 'Project', 'total_ipus': 'IPUs'})
             st.dataframe(show, width='stretch', hide_index=True)
-    with c3:
-        st.caption("Tasks")
-        if task_drivers.empty:
-            st.write("—")
         else:
-            show = task_drivers.head(10)[['org', 'task_name', 'total_ipus']].copy()
+            show = task_drivers.copy()
+            if not proj_drivers.empty:
+                proj_totals = proj_drivers.set_index('project_name')['total_ipus']
+                show['project_total'] = show['project_name'].map(proj_totals)
+            else:
+                show['project_total'] = pd.NA
+            show['project_total'] = show['project_total'].fillna(
+                show.groupby('project_name')['total_ipus'].transform('sum')
+            )
+            show = show.sort_values(
+                ['project_total', 'total_ipus'], ascending=[False, False]
+            ).head(25)
+            if total_for_pct > 0:
+                show['%'] = (show['total_ipus'] / total_for_pct * 100).round(1)
+            else:
+                show['%'] = 0.0
             show['total_ipus'] = show['total_ipus'].round(2)
-            show = show.rename(columns={'org': 'Org', 'task_name': 'Task', 'total_ipus': 'IPUs'})
-            st.dataframe(show, width='stretch', hide_index=True)
+            show['project_total'] = show['project_total'].round(2)
+            show = show.rename(columns={
+                'org': 'Org',
+                'project_name': 'Project',
+                'task_name': 'Task',
+                'total_ipus': 'Task IPUs',
+                'project_total': 'Project IPUs',
+            })
+            st.dataframe(
+                show[['Org', 'Project', 'Task', 'Task IPUs', 'Project IPUs', '%']],
+                width='stretch',
+                hide_index=True,
+            )
 
     if not spike_days.empty and driver_scope == "Whole month":
         st.markdown("#### Spike days vs normal")
