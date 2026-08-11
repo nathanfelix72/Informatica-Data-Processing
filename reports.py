@@ -1399,7 +1399,8 @@ def get_org_daily_stats_by_date_range(start_date: str, end_date: str,
 
 
 def get_project_stats_by_date_range(start_date: str, end_date: str,
-                                    log_type: str = None) -> pd.DataFrame:
+                                     org: str = None,
+                                     log_type: str = None) -> pd.DataFrame:
     """Get statistics by project for a date range."""
     init_database()
     conn = sqlite3.connect(DB_PATH)
@@ -1415,11 +1416,48 @@ def get_project_stats_by_date_range(start_date: str, end_date: str,
         "FROM tasks WHERE end_time >= ? AND end_time <= ?"
     )
     params = ipu_params + cost_params + [f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    if org:
+        query += ' AND org = ?'
+        params.append(org)
     query, params = _append_log_type_filter(query, params, log_type)
     query += " GROUP BY project_name ORDER BY total_ipus DESC"
     project_stats = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return project_stats
+
+
+def get_task_name_stats_by_date_range(start_date: str, end_date: str,
+                                      org: str = None, log_type: str = None,
+                                      limit: int = 25) -> pd.DataFrame:
+    """Top tasks by IPU for a date range (org + project + task name)."""
+    init_database()
+    conn = sqlite3.connect(DB_PATH)
+
+    ipu_expr, ipu_params = _effective_ipu_sql()
+    cost_expr, cost_params = _effective_cost_sql()
+
+    query = (
+        "SELECT "
+        "COALESCE(NULLIF(TRIM(org), ''), 'Unknown') AS org, "
+        "COALESCE(NULLIF(TRIM(project_name), ''), '(No project)') AS project_name, "
+        "COALESCE(NULLIF(TRIM(task_name), ''), '(Unnamed)') AS task_name, "
+        "COUNT(*) AS task_count, "
+        "COALESCE(SUM(" + ipu_expr + "), 0) AS total_ipus, "
+        "COALESCE(SUM(" + cost_expr + "), 0) AS total_cost "
+        "FROM tasks WHERE end_time >= ? AND end_time <= ?"
+    )
+    params = ipu_params + cost_params + [f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+    if org:
+        query += ' AND org = ?'
+        params.append(org)
+    query, params = _append_log_type_filter(query, params, log_type)
+    query += " GROUP BY org, project_name, task_name ORDER BY total_ipus DESC"
+    if limit:
+        query += " LIMIT ?"
+        params.append(int(limit))
+    task_stats = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return task_stats
 
 
 def _normalize_environment_base(name) -> str:

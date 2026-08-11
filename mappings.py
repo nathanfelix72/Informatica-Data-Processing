@@ -32,6 +32,62 @@ BASE_ORGS = [
 # Mass Ingestion is tracked as its own org (same base name, distinct series).
 MASS_INGESTION_ORG_SUFFIX = " Mass Ingestion"
 
+# Billing / governance parents and their Informatica child orgs.
+PARENT_ORG_CHILDREN = {
+    "CES-Prod": ["BYU-Prod", "BYU-Campus-Prod"],
+    "CES-Sandbox": ["BYU-Dev", "BYU-Int", "BYU-Campus-Int"],
+}
+
+CHILD_TO_PARENT = {
+    child: parent
+    for parent, children in PARENT_ORG_CHILDREN.items()
+    for child in children
+}
+
+
+def base_org_name(org_name):
+    """Strip Mass Ingestion suffix so TU and MI map to the same base org."""
+    text = str(org_name).strip() if org_name is not None else ""
+    if not text:
+        return "Unknown"
+    if text.endswith(MASS_INGESTION_ORG_SUFFIX):
+        return text[: -len(MASS_INGESTION_ORG_SUFFIX)].strip() or "Unknown"
+    return text
+
+
+def parent_org_name(org_name):
+    """Map a child/base org (or its MI twin) to CES-Prod / CES-Sandbox."""
+    base = base_org_name(org_name)
+    if base in PARENT_ORG_CHILDREN:
+        return base
+    return CHILD_TO_PARENT.get(base, "Other")
+
+
+def expand_org_focus(selection):
+    """Resolve a Quick Answers focus into concrete org labels to include.
+
+    - All orgs / None → None (no filter)
+    - CES-Prod / CES-Sandbox → all children + Mass Ingestion twins
+    - A specific label → only that label
+    """
+    if selection is None or selection in ("All orgs", "", "All"):
+        return None
+    text = str(selection).strip()
+    if text in PARENT_ORG_CHILDREN:
+        children = PARENT_ORG_CHILDREN[text]
+        return children + [mass_ingestion_org_name(child) for child in children]
+    return [text]
+
+
+def get_focus_options(available_orgs=None):
+    """Focus dropdown: All, parents, then concrete org series present in data."""
+    options = ["All orgs", "CES-Prod", "CES-Sandbox"]
+    if available_orgs:
+        for org in sorted({str(o) for o in available_orgs if o is not None and str(o).strip()}):
+            if org not in options:
+                options.append(org)
+    return options
+
 
 def mass_ingestion_org_name(org_name):
     """Return the Mass Ingestion org label for a base org name."""

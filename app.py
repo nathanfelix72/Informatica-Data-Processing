@@ -31,7 +31,16 @@ from processing import (
     LOG_TYPE_MASS_INGESTION,
     LOG_TYPE_TASK_USAGE,
 )
-from mappings import get_all_org_options, mass_ingestion_org_name, is_mass_ingestion_org
+from mappings import (
+    get_all_org_options,
+    mass_ingestion_org_name,
+    is_mass_ingestion_org,
+    base_org_name,
+    parent_org_name,
+    expand_org_focus,
+    get_focus_options,
+    PARENT_ORG_CHILDREN,
+)
 from calculations import (
     calculate_cost_per_ipu_month,
     calculate_ipus,
@@ -62,6 +71,8 @@ from reports import (
     get_status_stats_by_date_range,
     detect_anomalies_in_date_range,
     get_task_spikes_for_period,
+    get_task_name_stats_by_date_range,
+    get_org_daily_stats_by_date_range,
 )
 
 
@@ -1174,6 +1185,348 @@ def display_save_run_section(df):
             st.error(f"Error saving history: {str(e)}")
 
 
+def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=None):
+    """Simple operational views for common IPU questions."""
+    today = datetime.now().date()
+    default_month = analysis_end.replace(day=1)
+
+    ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1, 1.4])
+    with ctrl1:
+        month_options = []
+        cursor = (max_date or analysis_end).replace(day=1)
+        earliest = (min_date or analysis_end).replace(day=1)
+        while cursor >= earliest and len(month_options) < 24:
+            month_options.append(cursor)
+            cursor = (cursor - timedelta(days=1)).replace(day=1)
+
+        def _month_label(d):
+            return d.strftime('%B %Y')
+
+        selected_month = st.selectbox(
+            "Month",
+            options=month_options,
+            format_func=_month_label,
+            index=month_options.index(default_month) if default_month in month_options else 0,
+            key="quick_answers_month",
+        )
+    with ctrl2:
+        if 'quick_answers_budget' not in st.session_state:
+            st.session_state.quick_answers_budget = 0.0
+        monthly_budget = st.number_input(
+            "Monthly IPU budget",
+            min_value=0.0,
+            step=100.0,
+            key="quick_answers_budget",
+        )
+
+    month_start = selected_month
+    if month_start.month == 12:
+        month_end_full = month_start.replace(year=month_start.year + 1, month=1, day=1) - timedelta(days=1)
+    else:
+        month_end_full = month_start.replace(month=month_start.month + 1, day=1) - timedelta(days=1)
+
+    month_end = min(month_end_full, analysis_end, today - timedelta(days=1))
+    if month_end < month_start:
+        st.warning("No complete days in this month yet.")
+        return
+
+    days_in_month = month_end_full.day
+    days_elapsed = (month_end - month_start).days + 1
+
+    org_stats_all = get_org_stats_by_date_range(
+        month_start.isoformat(), month_end.isoformat(), log_type=log_type
+    )
+    available = (
+        org_stats_all['org'].dropna().astype(str).tolist()
+        if not org_stats_all.empty else []
+    )
+    focus_options = get_focus_options(available)
+    with ctrl3:
+        org_filter = st.selectbox(
+            "Focus",
+            options=focus_options,
+            key="quick_answers_org",
+        )
+    scope_orgs = expand_org_focus(org_filter)
+    # Single concrete org label for APIs that only accept one org
+    selected_org = None
+    if scope_orgs is not None and len(scope_orgs) == 1:
+        selected_org = scope_orgs[0]
+
+    org_daily_all = get_org_daily_stats_by_date_range(
+        month_start.isoformat(), month_end.isoformat(), log_type=log_type
+    )
+    if org_daily_all.empty:
+        daily = pd.DataFrame(columns=['date', 'total_ipus', 'task_count', 'total_cost'])
+    else:
+        scoped_daily = org_daily_all.copy()
+        if scope_orgs is not None:
+            scoped_daily = scoped_daily[scoped_daily['org'].isin(scope_orgs)]
+        daily = (
+            scoped_daily.groupby('date', as_index=False)
+            .agg(
+                task_count=('task_count', 'sum'),
+                total_ipus=('total_ipus', 'sum'),
+                total_cost=('total_cost', 'sum'),
+            )
+            .sort_values('date')
+        )
+
+    mtd_ipus = float(daily['total_ipus'].sum()) if not daily.empty else 0.0
+    avg_daily = mtd_ipus / days_elapsed if days_elapsed else 0.0
+    projected = avg_daily * days_in_month
+    budget_pct = (mtd_ipus / monthly_budget * 100.0) if monthly_budget > 0 else None
+    expected_pct = (days_elapsed / days_in_month * 100.0) if days_in_month else 0.0
+
+    # Prior month same span for comparison
+    prev_month_end = month_start - timedelta(days=1)
+    prev_month_start = prev_month_end.replace(day=1)
+    prev_span_end = prev_month_start + timedelta(days=min(days_elapsed, prev_month_end.day) - 1)
+    prev_org_daily = get_org_daily_stats_by_date_range(
+        prev_month_start.isoformat(), prev_span_end.isoformat(), log_type=log_type
+    )
+    if prev_org_daily.empty:
+        prev_mtd = 0.0
+    else:
+        prev_scoped = prev_org_daily
+        if scope_orgs is not None:
+            prev_scoped = prev_scoped[prev_scoped['org'].isin(scope_orgs)]
+        prev_mtd = float(prev_scoped['total_ipus'].sum())
+    delta_vs_prev = mtd_ipus - prev_mtd
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Month-to-date IPUs", f"{mtd_ipus:,.1f}")
+    with m2:
+        if budget_pct is not None:
+            st.metric(
+                "% of budget",
+                f"{budget_pct:.1f}%",
+                delta=f"{budget_pct - expected_pct:+.1f} pts vs pace",
+                delta_color="inverse",
+            )
+        else:
+            st.metric("% of budget", "—")
+    with m3:
+        st.metric("Projected month-end", f"{projected:,.1f}")
+    with m4:
+        st.metric(
+            f"vs prior month (first {days_elapsed}d)",
+            f"{mtd_ipus:,.1f}",
+            delta=f"{delta_vs_prev:+,.1f} IPUs",
+            delta_color="inverse",
+        )
+
+    # Parent organization split (CES-Prod vs CES-Sandbox)
+    if not org_stats_all.empty and org_filter == "All orgs":
+        parent_roll = org_stats_all.copy()
+        parent_roll['parent'] = parent_roll['org'].map(parent_org_name)
+        parent_sum = (
+            parent_roll.groupby('parent', as_index=False)['total_ipus']
+            .sum()
+            .sort_values('total_ipus', ascending=False)
+        )
+        parent_total = float(parent_sum['total_ipus'].sum()) or 1.0
+        pcols = st.columns(max(len(parent_sum), 1))
+        for idx, row in enumerate(parent_sum.itertuples()):
+            with pcols[idx]:
+                pct = float(row.total_ipus) / parent_total * 100.0
+                st.metric(str(row.parent), f"{row.total_ipus:,.1f} IPUs", delta=f"{pct:.1f}% of total")
+
+    st.markdown("#### Day by day")
+    if daily.empty:
+        st.info("No data for this month.")
+        return
+
+    chart_df = daily.copy()
+    chart_df['date'] = pd.to_datetime(chart_df['date'], errors='coerce')
+    chart_df = chart_df.dropna(subset=['date']).sort_values('date')
+    full_index = pd.date_range(month_start, month_end, freq='D')
+    chart_df = chart_df.set_index('date').reindex(full_index, fill_value=0.0)
+    chart_df.index.name = 'date'
+    chart_df = chart_df.reset_index()
+    chart_df['avg'] = avg_daily
+
+    mean = float(chart_df['total_ipus'].mean()) if len(chart_df) else 0.0
+    std = float(chart_df['total_ipus'].std(ddof=0)) if len(chart_df) else 0.0
+    spike_cut = mean + max(std, mean * 0.25) if mean > 0 else 0.0
+    chart_df['spike'] = chart_df['total_ipus'] >= spike_cut
+
+    plot_df = chart_df.set_index('date')[['total_ipus', 'avg']].rename(
+        columns={'total_ipus': 'IPUs', 'avg': 'Avg so far'}
+    )
+    st.line_chart(plot_df, width='stretch', height=280)
+
+    spike_days = chart_df[chart_df['spike']].sort_values('total_ipus', ascending=False)
+    top_days = chart_df.sort_values('total_ipus', ascending=False).head(5)
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### Hottest days")
+        hot = top_days[['date', 'total_ipus']].copy()
+        hot['date'] = hot['date'].dt.strftime('%b %d')
+        hot['total_ipus'] = hot['total_ipus'].round(2)
+        hot = hot.rename(columns={'date': 'Day', 'total_ipus': 'IPUs'})
+        st.dataframe(hot, width='stretch', hide_index=True)
+    with right:
+        day_labels = [
+            f"{r.date.strftime('%b %d')} — {r.total_ipus:,.1f} IPUs"
+            for r in top_days.itertuples()
+        ]
+        picked = st.selectbox(
+            "Inspect day",
+            options=day_labels if day_labels else ["(none)"],
+            key="quick_answers_day",
+        )
+        inspect_date = None
+        if picked and picked != "(none)" and picked in day_labels:
+            inspect_date = top_days.iloc[day_labels.index(picked)]['date'].date()
+
+    st.markdown("#### What's driving it")
+    driver_scope = st.radio(
+        "Drivers for",
+        ["Whole month", "Selected day"],
+        horizontal=True,
+        key="quick_answers_driver_scope",
+    )
+
+    if driver_scope == "Selected day" and inspect_date is not None:
+        d_start = inspect_date.isoformat()
+        d_end = inspect_date.isoformat()
+    else:
+        d_start = month_start.isoformat()
+        d_end = month_end.isoformat()
+
+    org_drivers = get_org_stats_by_date_range(d_start, d_end, log_type=log_type)
+    if scope_orgs is not None and not org_drivers.empty:
+        org_drivers = org_drivers[org_drivers['org'].isin(scope_orgs)]
+
+    if scope_orgs is None or len(scope_orgs) <= 1:
+        proj_drivers = get_project_stats_by_date_range(
+            d_start, d_end, org=selected_org, log_type=log_type
+        )
+        task_drivers = get_task_name_stats_by_date_range(
+            d_start, d_end, org=selected_org, log_type=log_type, limit=15
+        )
+    else:
+        proj_frames = [
+            get_project_stats_by_date_range(d_start, d_end, org=o, log_type=log_type)
+            for o in scope_orgs
+        ]
+        proj_drivers = (
+            pd.concat([f for f in proj_frames if f is not None and not f.empty], ignore_index=True)
+            if any(f is not None and not f.empty for f in proj_frames) else pd.DataFrame()
+        )
+        if not proj_drivers.empty:
+            proj_drivers = (
+                proj_drivers.groupby('project_name', as_index=False)
+                .agg(
+                    task_count=('task_count', 'sum'),
+                    total_ipus=('total_ipus', 'sum'),
+                    total_cost=('total_cost', 'sum'),
+                )
+                .sort_values('total_ipus', ascending=False)
+            )
+        task_frames = [
+            get_task_name_stats_by_date_range(d_start, d_end, org=o, log_type=log_type, limit=15)
+            for o in scope_orgs
+        ]
+        task_drivers = (
+            pd.concat([f for f in task_frames if f is not None and not f.empty], ignore_index=True)
+            if any(f is not None and not f.empty for f in task_frames) else pd.DataFrame()
+        )
+        if not task_drivers.empty:
+            task_drivers = (
+                task_drivers.groupby(['org', 'project_name', 'task_name'], as_index=False)
+                .agg(
+                    task_count=('task_count', 'sum'),
+                    total_ipus=('total_ipus', 'sum'),
+                    total_cost=('total_cost', 'sum'),
+                )
+                .sort_values('total_ipus', ascending=False)
+                .head(15)
+            )
+
+    total_for_pct = float(org_drivers['total_ipus'].sum()) if not org_drivers.empty else 0.0
+
+    c1, c2, c3 = st.columns([1.4, 1, 1.2])
+    with c1:
+        st.caption("Orgs")
+        if org_drivers.empty:
+            st.write("—")
+        else:
+            show = org_drivers[['org', 'total_ipus']].copy()
+            show['parent'] = show['org'].map(parent_org_name)
+            show['family'] = show['org'].map(base_org_name)
+            family_totals = show.groupby('family')['total_ipus'].transform('sum')
+            if total_for_pct > 0:
+                # Combined % for TU + MI of the same org; rows stay separate.
+                show['Org %'] = (family_totals / total_for_pct * 100).round(1)
+                show['Log %'] = (show['total_ipus'] / total_for_pct * 100).round(1)
+            else:
+                show['Org %'] = 0.0
+                show['Log %'] = 0.0
+            show['total_ipus'] = show['total_ipus'].round(2)
+            show = show.sort_values(['parent', 'Org %', 'total_ipus'], ascending=[True, False, False])
+            show = show.rename(columns={
+                'parent': 'Parent',
+                'org': 'Org',
+                'total_ipus': 'IPUs',
+            })
+            st.dataframe(
+                show[['Parent', 'Org', 'IPUs', 'Org %', 'Log %']],
+                width='stretch',
+                hide_index=True,
+            )
+    with c2:
+        st.caption("Projects")
+        if proj_drivers.empty:
+            st.write("—")
+        else:
+            show = proj_drivers.head(10)[['project_name', 'total_ipus']].copy()
+            show['total_ipus'] = show['total_ipus'].round(2)
+            show = show.rename(columns={'project_name': 'Project', 'total_ipus': 'IPUs'})
+            st.dataframe(show, width='stretch', hide_index=True)
+    with c3:
+        st.caption("Tasks")
+        if task_drivers.empty:
+            st.write("—")
+        else:
+            show = task_drivers.head(10)[['org', 'task_name', 'total_ipus']].copy()
+            show['total_ipus'] = show['total_ipus'].round(2)
+            show = show.rename(columns={'org': 'Org', 'task_name': 'Task', 'total_ipus': 'IPUs'})
+            st.dataframe(show, width='stretch', hide_index=True)
+
+    if not spike_days.empty and driver_scope == "Whole month":
+        st.markdown("#### Spike days vs normal")
+        org_daily = get_org_daily_stats_by_date_range(
+            month_start.isoformat(), month_end.isoformat(), log_type=log_type
+        )
+        if not org_daily.empty:
+            org_daily = org_daily.copy()
+            org_daily['date'] = pd.to_datetime(org_daily['date'], errors='coerce').dt.date
+            spike_dates = set(spike_days['date'].dt.date.tolist())
+            org_daily['bucket'] = org_daily['date'].map(
+                lambda d: 'Spike days' if d in spike_dates else 'Other days'
+            )
+            if scope_orgs is not None:
+                org_daily = org_daily[org_daily['org'].isin(scope_orgs)]
+            pivot = (
+                org_daily.groupby(['org', 'bucket'], dropna=False)['total_ipus']
+                .sum()
+                .unstack(fill_value=0.0)
+                .reset_index()
+            )
+            for col in ['Spike days', 'Other days']:
+                if col not in pivot.columns:
+                    pivot[col] = 0.0
+            pivot['Spike days'] = pivot['Spike days'].round(2)
+            pivot['Other days'] = pivot['Other days'].round(2)
+            pivot = pivot.sort_values('Spike days', ascending=False).head(12)
+            pivot = pivot.rename(columns={'org': 'Org'})
+            st.dataframe(pivot[['Org', 'Spike days', 'Other days']], width='stretch', hide_index=True)
+
+
 def display_historical_analysis():
     """Display historical analysis based on task end dates (not run dates)."""
     st.header("Historical Analysis")
@@ -1746,6 +2099,7 @@ def display_historical_analysis():
             analysis_section = st.radio(
                 "Analysis section",
                 [
+                    "Quick Answers",
                     "Narrative Summary",
                     "Daily Trends",
                     "By Organization",
@@ -1756,7 +2110,15 @@ def display_historical_analysis():
                 key="historical_analysis_section",
             )
 
-            if analysis_section == "Narrative Summary":
+            if analysis_section == "Quick Answers":
+                display_quick_answers(
+                    analysis_end=analysis_end,
+                    log_type=log_type,
+                    min_date=min_date,
+                    max_date=max_date,
+                )
+
+            elif analysis_section == "Narrative Summary":
                 # Narrative Summary (copy-paste text) placed as first tab
                 st.subheader("Narrative Summary")
                 st.write("Copyable executive summary with totals, per-org lines, and anomaly bullets.")
