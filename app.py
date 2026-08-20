@@ -75,6 +75,7 @@ from reports import (
     get_task_name_stats_by_date_range,
     get_org_daily_stats_by_date_range,
     get_filtered_daily_stats_by_date_range,
+    get_task_usage_lookup_by_date_range,
 )
 
 
@@ -2017,6 +2018,162 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
             st.dataframe(pivot[['Org', 'Spike days', 'Other days']], width='stretch', hide_index=True)
 
 
+def display_task_ipu_lookup(min_date, max_date, analysis_end, log_type=None):
+    """Interactive lookup for task/object IPU usage over a custom time period."""
+    st.subheader("Task IPU Lookup")
+    st.caption(
+        "Search by task object or task name, scoped to a folder and date range. "
+        "Older history rows may only have task name values."
+    )
+
+    default_start = max(min_date, analysis_end - timedelta(days=30))
+    default_end = analysis_end
+
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        start_date = st.date_input(
+            "Start date",
+            value=default_start,
+            min_value=min_date,
+            max_value=max_date,
+            key="task_lookup_start_date",
+        )
+    with c2:
+        end_date = st.date_input(
+            "End date",
+            value=default_end,
+            min_value=min_date,
+            max_value=max_date,
+            key="task_lookup_end_date",
+        )
+    with c3:
+        match_mode = st.selectbox(
+            "Match mode",
+            options=["contains", "exact"],
+            key="task_lookup_match_mode",
+            help="Use contains for partial names; exact for strict matching.",
+        )
+
+    q1, q2 = st.columns([1.2, 1])
+    with q1:
+        task_query = st.text_input(
+            "Task object or task name",
+            value=st.session_state.get("task_lookup_task_query", "tf_std_term_status_ext"),
+            key="task_lookup_task_query",
+            help="Matches against task object name first, then task name fallback.",
+        ).strip()
+    with q2:
+        folder_query = st.text_input(
+            "Folder contains",
+            value=st.session_state.get("task_lookup_folder_query", "student academics ODS"),
+            key="task_lookup_folder_query",
+            help="Optional folder filter. Leave blank to search all folders.",
+        ).strip()
+
+    if start_date > end_date:
+        st.error("Start date must be before end date.")
+        return
+
+    if not task_query:
+        st.info("Enter a task object/name to run the lookup.")
+        return
+
+    rows = get_task_usage_lookup_by_date_range(
+        start_date=start_date.isoformat(),
+        end_date=end_date.isoformat(),
+        task_query=task_query,
+        folder_query=folder_query if folder_query else None,
+        log_type=log_type,
+        match_mode=match_mode,
+    )
+
+    if rows.empty:
+        st.warning("No matching task usage found for the selected filters.")
+        return
+
+    rows['end_time'] = pd.to_datetime(rows['end_time'], errors='coerce')
+    rows = rows.dropna(subset=['end_time'])
+
+    total_ipus = float(rows['effective_ipus'].sum())
+    total_cost = float(rows['effective_cost'].sum())
+    run_count = int(len(rows))
+    object_coverage = float((rows['task_object_name'].astype(str).str.strip() != '').mean() * 100.0)
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Total IPUs", f"{total_ipus:,.2f}")
+    with m2:
+        st.metric("Task runs", f"{run_count:,}")
+    with m3:
+        st.metric("Total cost", f"${total_cost:,.2f}")
+    with m4:
+        st.metric("Task object coverage", f"{object_coverage:.0f}%")
+
+    daily = (
+        rows.assign(date=rows['end_time'].dt.date)
+        .groupby('date', as_index=False)
+        .agg(
+            task_runs=('task_run_id', 'count'),
+            total_ipus=('effective_ipus', 'sum'),
+            total_cost=('effective_cost', 'sum'),
+        )
+        .sort_values('date')
+    )
+
+    st.markdown("#### Daily trend")
+    chart_df = daily.copy()
+    chart_df['date'] = pd.to_datetime(chart_df['date'], errors='coerce')
+    st.line_chart(
+        chart_df.set_index('date')[['total_ipus']],
+        width='stretch',
+        height=250,
+    )
+
+    c5, c6 = st.columns(2)
+    with c5:
+        by_org = (
+            rows.groupby('org', as_index=False)
+            .agg(total_ipus=('effective_ipus', 'sum'), task_runs=('task_run_id', 'count'))
+            .sort_values('total_ipus', ascending=False)
+        )
+        by_org['total_ipus'] = by_org['total_ipus'].round(2)
+        st.markdown("#### By organization")
+        st.dataframe(by_org, width='stretch', hide_index=True)
+
+    with c6:
+        by_project = (
+            rows.groupby('project_name', as_index=False)
+            .agg(total_ipus=('effective_ipus', 'sum'), task_runs=('task_run_id', 'count'))
+            .sort_values('total_ipus', ascending=False)
+        )
+        by_project['total_ipus'] = by_project['total_ipus'].round(2)
+        st.markdown("#### By project")
+        st.dataframe(by_project, width='stretch', hide_index=True)
+
+    st.markdown("#### Matching task runs")
+    details = rows[[
+        'end_time', 'org', 'project_name', 'folder_name', 'task_object_name', 'task_name',
+        'log_type', 'metered_value', 'effective_ipus', 'effective_cost', 'task_run_id'
+    ]].copy()
+    details = details.rename(columns={
+        'end_time': 'End Time',
+        'org': 'Org',
+        'project_name': 'Project',
+        'folder_name': 'Folder',
+        'task_object_name': 'Task Object Name',
+        'task_name': 'Task Name',
+        'log_type': 'Log Type',
+        'metered_value': 'Metered Value',
+        'effective_ipus': 'IPUs',
+        'effective_cost': 'Cost',
+        'task_run_id': 'Task Run ID',
+    })
+    details['IPUs'] = pd.to_numeric(details['IPUs'], errors='coerce').round(6)
+    details['Cost'] = pd.to_numeric(details['Cost'], errors='coerce').round(6)
+    details['Metered Value'] = pd.to_numeric(details['Metered Value'], errors='coerce').round(6)
+    st.dataframe(details, width='stretch', hide_index=True)
+
+
 def display_historical_analysis():
     """Display historical analysis based on task end dates (not run dates)."""
     st.header("Historical Analysis")
@@ -2590,6 +2747,7 @@ def display_historical_analysis():
                 "Analysis section",
                 [
                     "Quick Answers",
+                    "Task IPU Lookup",
                     "Narrative Summary",
                     "Daily Trends",
                     "By Organization",
@@ -2606,6 +2764,14 @@ def display_historical_analysis():
                     log_type=log_type,
                     min_date=min_date,
                     max_date=max_date,
+                )
+
+            elif analysis_section == "Task IPU Lookup":
+                display_task_ipu_lookup(
+                    min_date=min_date,
+                    max_date=max_date,
+                    analysis_end=analysis_end,
+                    log_type=log_type,
                 )
 
             elif analysis_section == "Narrative Summary":

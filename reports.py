@@ -148,6 +148,7 @@ def init_database():
             task_record_id INTEGER PRIMARY KEY AUTOINCREMENT,
             task_id TEXT,
             task_name TEXT,
+            task_object_name TEXT,
             task_type TEXT,
             task_run_id TEXT,
             row_hash TEXT,
@@ -190,6 +191,7 @@ def init_database():
         ('row_hash', 'ALTER TABLE tasks ADD COLUMN row_hash TEXT'),
         ('agent_name', 'ALTER TABLE tasks ADD COLUMN agent_name TEXT'),
         ('log_type', 'ALTER TABLE tasks ADD COLUMN log_type TEXT'),
+        ('task_object_name', 'ALTER TABLE tasks ADD COLUMN task_object_name TEXT'),
     ]:
         if column not in cols:
             try:
@@ -205,6 +207,7 @@ def init_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_project ON tasks(project_name)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_environment ON tasks(environment)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_task_type ON tasks(task_type)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_task_object_name ON tasks(task_object_name)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_status ON tasks(status)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_log_type ON tasks(log_type)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_events_created_at ON history_events(created_at)')
@@ -611,7 +614,7 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
 
     # Use a wider set of source columns for storage than we use for dedupe hashing.
     insert_source_columns = [
-        'Task ID', 'Task Name', 'Task Type', 'Task Run ID',
+        'Task ID', 'Task Name', 'Task Object Name', 'Task Type', 'Task Run ID',
         'Agent Name', 'Project Name', 'Folder Name', 'Org', 'Environment', 'Status',
         'Log Type', 'Start Time', 'End Time', 'IPUs', 'Cost/IPU/Month', 'Metered Value', 'Cores Used'
     ]
@@ -649,6 +652,7 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
     col_map = {
         'Task ID': 'task_id',
         'Task Name': 'task_name',
+        'Task Object Name': 'task_object_name',
         'Task Type': 'task_type',
         'Task Run ID': 'task_run_id',
         'Agent Name': 'agent_name',
@@ -670,7 +674,7 @@ def save_run(merged_df: pd.DataFrame) -> tuple[int, int, str | None, str | None,
 
     insert_cols = [
         col for col in [
-            'task_id', 'task_name', 'task_type', 'task_run_id', 'row_hash',
+            'task_id', 'task_name', 'task_object_name', 'task_type', 'task_run_id', 'row_hash',
             'agent_name', 'project_name', 'folder_name', 'org', 'environment', 'status',
             'log_type', 'start_time', 'end_time', 'ipus', 'cost', 'metered_value', 'cores_used'
         ] if col in new_rows_df.columns
@@ -1516,6 +1520,85 @@ def get_filtered_daily_stats_by_date_range(
     daily = pd.read_sql_query(query, conn, params=params)
     conn.close()
     return daily
+
+
+def get_task_usage_lookup_by_date_range(
+    start_date: str,
+    end_date: str,
+    task_query: str,
+    folder_query: str = None,
+    org: str = None,
+    log_type: str = None,
+    match_mode: str = 'contains',
+) -> pd.DataFrame:
+    """Return task rows matching a task object/name query in a date window.
+
+    Matching is performed against both `task_object_name` (preferred) and
+    `task_name` (fallback for older rows that do not have object names).
+    """
+    init_database()
+    conn = sqlite3.connect(DB_PATH)
+
+    ipu_expr, ipu_params = _effective_ipu_sql()
+    cost_expr, cost_params = _effective_cost_sql()
+
+    query = (
+        "SELECT "
+        "task_run_id, "
+        "COALESCE(NULLIF(TRIM(task_object_name), ''), NULLIF(TRIM(task_name), ''), '(Unnamed)') AS matched_task, "
+        "COALESCE(NULLIF(TRIM(task_object_name), ''), '') AS task_object_name, "
+        "COALESCE(NULLIF(TRIM(task_name), ''), '') AS task_name, "
+        "COALESCE(NULLIF(TRIM(folder_name), ''), '(No folder)') AS folder_name, "
+        "COALESCE(NULLIF(TRIM(project_name), ''), '(No project)') AS project_name, "
+        "COALESCE(NULLIF(TRIM(org), ''), 'Unknown') AS org, "
+        "COALESCE(NULLIF(TRIM(log_type), ''), 'Task Usage') AS log_type, "
+        "end_time, "
+        "COALESCE(" + ipu_expr + ", 0) AS effective_ipus, "
+        "COALESCE(" + cost_expr + ", 0) AS effective_cost, "
+        "COALESCE(metered_value, 0) AS metered_value "
+        "FROM tasks WHERE end_time >= ? AND end_time <= ?"
+    )
+    params = ipu_params + cost_params + [f'{start_date} 00:00:00', f'{end_date} 23:59:59']
+
+    cleaned_task_query = (task_query or '').strip().lower()
+    if cleaned_task_query:
+        if match_mode == 'exact':
+            query += (
+                " AND ("
+                "LOWER(TRIM(COALESCE(task_object_name, ''))) = ? "
+                "OR LOWER(TRIM(COALESCE(task_name, ''))) = ?"
+                ")"
+            )
+            params.extend([cleaned_task_query, cleaned_task_query])
+        else:
+            like_query = f"%{cleaned_task_query}%"
+            query += (
+                " AND ("
+                "LOWER(TRIM(COALESCE(task_object_name, ''))) LIKE ? "
+                "OR LOWER(TRIM(COALESCE(task_name, ''))) LIKE ?"
+                ")"
+            )
+            params.extend([like_query, like_query])
+
+    cleaned_folder_query = (folder_query or '').strip().lower()
+    if cleaned_folder_query:
+        if match_mode == 'exact':
+            query += " AND LOWER(TRIM(COALESCE(folder_name, ''))) = ?"
+            params.append(cleaned_folder_query)
+        else:
+            query += " AND LOWER(TRIM(COALESCE(folder_name, ''))) LIKE ?"
+            params.append(f"%{cleaned_folder_query}%")
+
+    if org:
+        query += ' AND org = ?'
+        params.append(org)
+
+    query, params = _append_log_type_filter(query, params, log_type)
+    query += ' ORDER BY end_time DESC, effective_ipus DESC'
+
+    matches = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return matches
 
 
 def _normalize_environment_base(name) -> str:
