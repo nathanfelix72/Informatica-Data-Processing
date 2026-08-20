@@ -40,7 +40,7 @@ from mappings import (
     parent_org_name,
     expand_org_focus,
     get_focus_options,
-    PARENT_ORG_CHILDREN,
+    is_parent_org,
 )
 from calculations import (
     calculate_cost_per_ipu_month,
@@ -52,6 +52,8 @@ from calculations import (
     MASS_INGESTION_IPU_CONVERSION_FACTOR,
 )
 from reports import (
+    ensure_organization,
+    get_filename_org_patterns,
     save_run,
     delete_tasks_by_date_range,
     get_history_events,
@@ -212,6 +214,8 @@ def display_file_upload():
     org_assignments = {}
     log_type_assignments = {}
 
+    ADD_NEW_ORG = "➕ Add new organization…"
+
     def infer_org_from_filename(filename, org_options, used_orgs, log_type=None):
         """Guess the organization from the uploaded filename.
 
@@ -226,18 +230,7 @@ def display_file_upload():
             or (name.endswith('mi') and len(name) > 2)
         )
 
-        patterns = [
-            ("cessb", "CES-Sandbox"),
-            ("cessandbox", "CES-Sandbox"),
-            ("cesprod", "CES-Prod"),
-            ("byucampusprod", "BYU-Campus-Prod"),
-            ("campusprod", "BYU-Campus-Prod"),
-            ("byucampusint", "BYU-Campus-Int"),
-            ("campusint", "BYU-Campus-Int"),
-            ("byuprod", "BYU-Prod"),
-            ("byuint", "BYU-Int"),
-            ("byudev", "BYU-Dev"),
-        ]
+        patterns = get_filename_org_patterns()
 
         def candidate_for(base_org):
             return mass_ingestion_org_name(base_org) if is_mi else base_org
@@ -272,10 +265,12 @@ def display_file_upload():
         st.subheader("Select Organization and Log Type for Each File")
         st.caption(
             "Mass Ingestion files use their own org names (e.g. BYU-Dev Mass Ingestion) "
-            "so logs and charts stay separate from Task Usage."
+            "so logs and charts stay separate from Task Usage. "
+            "Pick an existing org or add a new one — names are stored in the database."
         )
         
         org_options = get_all_org_options()
+        select_options = org_options + [ADD_NEW_ORG]
         used_orgs = set()
         
         for uploaded_file in uploaded_files:
@@ -291,16 +286,31 @@ def display_file_upload():
                 else:
                     st.caption("Detected: Task Usage")
             with col2:
-                default_index = org_options.index(suggested_org) if suggested_org in org_options else 0
-                org = st.selectbox(
+                default_index = (
+                    select_options.index(suggested_org)
+                    if suggested_org in select_options
+                    else 0
+                )
+                choice = st.selectbox(
                     "Org",
-                    org_options,
+                    select_options,
                     index=default_index,
                     key=f"org_{uploaded_file.name}",
-                    label_visibility="collapsed"
+                    label_visibility="collapsed",
                 )
-                org_assignments[uploaded_file.name] = org
-                used_orgs.add(org)
+                if choice == ADD_NEW_ORG:
+                    new_org = st.text_input(
+                        "New organization name",
+                        key=f"new_org_{uploaded_file.name}",
+                        placeholder="e.g. Acme-Prod",
+                        help="Saved to the org catalog for future imports.",
+                    ).strip()
+                    org = new_org or None
+                else:
+                    org = choice
+                if org:
+                    org_assignments[uploaded_file.name] = org
+                    used_orgs.add(org)
             with col3:
                 log_default = LOG_TYPES.index(detected_log_type) if detected_log_type in LOG_TYPES else 0
                 log_type = st.selectbox(
@@ -312,8 +322,22 @@ def display_file_upload():
                 )
                 log_type_assignments[uploaded_file.name] = log_type
         
-        if st.button("Process Files", width="stretch"):
+        missing_orgs = [
+            f.name for f in uploaded_files if f.name not in org_assignments
+        ]
+        if missing_orgs:
+            st.warning(
+                "Enter a name for each file set to “Add new organization…” before processing."
+            )
+
+        if st.button(
+            "Process Files",
+            width="stretch",
+            disabled=bool(missing_orgs),
+        ):
             with st.spinner("Processing files..."):
+                for org in org_assignments.values():
+                    ensure_organization(org)
                 merged_df, errors = process_and_merge_files(
                     uploaded_files, org_assignments, log_type_assignments
                 )
@@ -1377,10 +1401,10 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
 
     # Parent + sub-org rollups (CES-Prod / CES-Sandbox and their children)
     if not org_stats_all.empty and (
-        org_filter == "All orgs" or org_filter in PARENT_ORG_CHILDREN
+        org_filter == "All orgs" or is_parent_org(org_filter)
     ):
         roll = org_stats_all.copy()
-        if org_filter in PARENT_ORG_CHILDREN:
+        if is_parent_org(org_filter):
             roll = roll[roll['org'].map(parent_org_name) == org_filter]
         roll['parent'] = roll['org'].map(parent_org_name)
         roll['family'] = roll['org'].map(base_org_name)
@@ -1410,7 +1434,7 @@ def display_quick_answers(analysis_end, log_type=None, min_date=None, max_date=N
 
         # Sub-orgs: TU + MI combined per family, same metric style as parents
         parents_to_show = (
-            [org_filter] if org_filter in PARENT_ORG_CHILDREN
+            [org_filter] if is_parent_org(org_filter)
             else parent_sum['parent'].tolist()
         )
         for parent in parents_to_show:
@@ -2093,6 +2117,89 @@ def display_task_ipu_lookup(min_date, max_date, analysis_end, log_type=None):
 
     rows['end_time'] = pd.to_datetime(rows['end_time'], errors='coerce')
     rows = rows.dropna(subset=['end_time'])
+    if rows.empty:
+        st.warning("No matching task usage found for the selected filters.")
+        return
+
+    # Distinct matching terms (object name preferred, else task name).
+    term_stats = (
+        rows.groupby('matched_task', as_index=False)
+        .agg(
+            task_runs=('task_run_id', 'count'),
+            total_ipus=('effective_ipus', 'sum'),
+            object_names=('task_object_name', lambda s: sorted({
+                str(v).strip() for v in s if str(v).strip()
+            })),
+            task_names=('task_name', lambda s: sorted({
+                str(v).strip() for v in s if str(v).strip()
+            })),
+        )
+        .sort_values(['total_ipus', 'task_runs'], ascending=False)
+    )
+
+    term_labels = {}
+    for row in term_stats.itertuples():
+        term = str(row.matched_task)
+        label = (
+            f"{term}  ·  {int(row.task_runs):,} runs  ·  {float(row.total_ipus):,.1f} IPUs"
+        )
+        term_labels[label] = term
+
+    labels = list(term_labels.keys())
+    terms = [term_labels[label] for label in labels]
+
+    if len(terms) == 1:
+        selected_terms = terms
+        st.caption(f"Matched term: **{terms[0]}**")
+    else:
+        st.markdown("#### Matching terms")
+        st.caption(
+            f"{len(terms)} distinct task object/name values matched “{task_query}”. "
+            "Select one or more to analyze — results are not combined until you pick."
+        )
+        # Reset selection when the search result set of terms changes.
+        term_key = (
+            f"{task_query}|{folder_query}|{match_mode}|"
+            f"{start_date}|{end_date}|{log_type}|{'||'.join(terms)}"
+        )
+        if st.session_state.get("task_lookup_term_key") != term_key:
+            st.session_state["task_lookup_term_key"] = term_key
+            st.session_state["task_lookup_selected_term_labels"] = []
+
+        selected_labels = st.multiselect(
+            "Select term(s) to include",
+            options=labels,
+            key="task_lookup_selected_term_labels",
+            help="Each option is a distinct matched task object or task name.",
+        )
+        selected_terms = [term_labels[label] for label in selected_labels]
+
+        with st.expander("Term details", expanded=False):
+            detail = term_stats.copy()
+            detail['total_ipus'] = detail['total_ipus'].round(2)
+            detail['object_names'] = detail['object_names'].apply(
+                lambda vals: ", ".join(vals) if vals else "—"
+            )
+            detail['task_names'] = detail['task_names'].apply(
+                lambda vals: ", ".join(vals) if vals else "—"
+            )
+            detail = detail.rename(columns={
+                'matched_task': 'Matched term',
+                'task_runs': 'Runs',
+                'total_ipus': 'IPUs',
+                'object_names': 'Task object names',
+                'task_names': 'Task names',
+            })
+            st.dataframe(detail, width='stretch', hide_index=True)
+
+        if not selected_terms:
+            st.info("Select one or more matching terms above to see IPU totals and trends.")
+            return
+
+    rows = rows[rows['matched_task'].isin(selected_terms)].copy()
+    if rows.empty:
+        st.warning("No rows left after term selection.")
+        return
 
     total_ipus = float(rows['effective_ipus'].sum())
     total_cost = float(rows['effective_cost'].sum())
@@ -2108,6 +2215,27 @@ def display_task_ipu_lookup(min_date, max_date, analysis_end, log_type=None):
         st.metric("Total cost", f"${total_cost:,.2f}")
     with m4:
         st.metric("Task object coverage", f"{object_coverage:.0f}%")
+
+    if len(selected_terms) > 1:
+        by_term = (
+            rows.groupby('matched_task', as_index=False)
+            .agg(
+                task_runs=('task_run_id', 'count'),
+                total_ipus=('effective_ipus', 'sum'),
+                total_cost=('effective_cost', 'sum'),
+            )
+            .sort_values('total_ipus', ascending=False)
+        )
+        by_term['total_ipus'] = by_term['total_ipus'].round(2)
+        by_term['total_cost'] = by_term['total_cost'].round(2)
+        by_term = by_term.rename(columns={
+            'matched_task': 'Term',
+            'task_runs': 'Runs',
+            'total_ipus': 'IPUs',
+            'total_cost': 'Cost',
+        })
+        st.markdown("#### Selected terms")
+        st.dataframe(by_term, width='stretch', hide_index=True)
 
     daily = (
         rows.assign(date=rows['end_time'].dt.date)

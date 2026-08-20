@@ -183,6 +183,25 @@ def init_database():
         )
     ''')
 
+    # Organization catalog (upload picklist). task.org stays denormalized text.
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS organizations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            informatica_id TEXT,
+            parent_name TEXT,
+            filename_tokens TEXT,
+            sort_order INTEGER DEFAULT 100,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute(
+        'CREATE INDEX IF NOT EXISTS idx_organizations_name ON organizations(name)'
+    )
+    cursor.execute(
+        'CREATE INDEX IF NOT EXISTS idx_organizations_sort ON organizations(sort_order)'
+    )
+
     # Migrate older DBs before creating indexes that depend on newer columns.
     # CREATE TABLE IF NOT EXISTS does not add columns to an existing table.
     cursor.execute("PRAGMA table_info(tasks)")
@@ -220,9 +239,248 @@ def init_database():
     # so they never combine with Task Usage for the same base name.
     _migrate_mass_ingestion_orgs(cursor, conn)
     _migrate_mass_ingestion_ipu_factor(cursor)
-    
+    _seed_organizations(cursor)
+
     conn.commit()
     conn.close()
+
+
+def _seed_organizations(cursor):
+    """Insert default orgs and any base names already present in tasks.
+
+    Never renames or updates existing tasks.org values — catalog only.
+    """
+    from mappings import (
+        DEFAULT_BASE_ORGS,
+        DEFAULT_ORG_ID_MAPPING,
+        DEFAULT_PARENT_ORG_CHILDREN,
+        DEFAULT_FILENAME_TOKENS,
+        base_org_name,
+    )
+
+    child_to_parent = {
+        child: parent
+        for parent, children in DEFAULT_PARENT_ORG_CHILDREN.items()
+        for child in children
+    }
+    # Parents are also selectable orgs.
+    for parent in DEFAULT_PARENT_ORG_CHILDREN:
+        child_to_parent.setdefault(parent, parent)
+
+    id_by_name = {name: oid for oid, name in DEFAULT_ORG_ID_MAPPING.items()}
+    tokens_by_name = {
+        name: ",".join(tokens) for name, tokens in DEFAULT_FILENAME_TOKENS.items()
+    }
+
+    cursor.execute("SELECT name FROM organizations")
+    existing = {row[0] for row in cursor.fetchall()}
+
+    # Discover base org names already used in task history (preserve spelling).
+    discovered = []
+    try:
+        cursor.execute(
+            """
+            SELECT DISTINCT org FROM tasks
+            WHERE org IS NOT NULL AND TRIM(org) != ''
+            """
+        )
+        for (org,) in cursor.fetchall():
+            base = base_org_name(org)
+            if base and base != "Unknown":
+                discovered.append(base)
+    except Exception:
+        pass
+
+    to_seed = []
+    seen = set(existing)
+    for idx, name in enumerate(DEFAULT_BASE_ORGS):
+        if name not in seen:
+            to_seed.append((name, idx * 10, True))
+            seen.add(name)
+    for name in discovered:
+        if name not in seen:
+            to_seed.append((name, 1000 + len(to_seed), False))
+            seen.add(name)
+
+    for name, sort_order, is_default in to_seed:
+        parent = child_to_parent.get(name)
+        # Self-parent only for known billing parents; leave others NULL.
+        if parent == name and name not in DEFAULT_PARENT_ORG_CHILDREN:
+            parent = None
+        informatica_id = id_by_name.get(name)
+        tokens = tokens_by_name.get(name)
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO organizations
+                (name, informatica_id, parent_name, filename_tokens, sort_order)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (name, informatica_id, parent, tokens, sort_order),
+        )
+
+
+def list_base_organizations():
+    """Return base organization names from the catalog (sorted)."""
+    init_database()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            """
+            SELECT name FROM organizations
+            ORDER BY sort_order ASC, name ASC
+            """
+        ).fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+
+def get_all_org_options():
+    """Base orgs plus Mass Ingestion counterparts for upload / filters."""
+    from mappings import mass_ingestion_org_name
+
+    options = []
+    for org in list_base_organizations():
+        options.append(org)
+        options.append(mass_ingestion_org_name(org))
+    return options
+
+
+def get_org_parent_map():
+    """Map base org name → billing parent (CES-Prod / CES-Sandbox / self / Other).
+
+    Built from organizations.parent_name; falls back to seed defaults when empty.
+    """
+    from mappings import DEFAULT_PARENT_ORG_CHILDREN
+
+    init_database()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            "SELECT name, parent_name FROM organizations"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    child_to_parent = {}
+    parents = set()
+    for name, parent_name in rows:
+        if parent_name:
+            child_to_parent[name] = parent_name
+            if parent_name == name:
+                parents.add(name)
+            else:
+                parents.add(parent_name)
+
+    if not child_to_parent:
+        for parent, children in DEFAULT_PARENT_ORG_CHILDREN.items():
+            parents.add(parent)
+            child_to_parent[parent] = parent
+            for child in children:
+                child_to_parent[child] = parent
+
+    return child_to_parent, parents
+
+
+def get_filename_org_patterns():
+    """Return (token, base_org) pairs for filename inference, longest tokens first."""
+    init_database()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            """
+            SELECT name, filename_tokens FROM organizations
+            WHERE filename_tokens IS NOT NULL AND TRIM(filename_tokens) != ''
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    patterns = []
+    for name, tokens in rows:
+        for token in str(tokens).split(","):
+            token = token.strip().lower()
+            if token:
+                patterns.append((token, name))
+
+    if not patterns:
+        from mappings import DEFAULT_FILENAME_TOKENS
+        for name, tokens in DEFAULT_FILENAME_TOKENS.items():
+            for token in tokens:
+                patterns.append((token, name))
+
+    patterns.sort(key=lambda item: len(item[0]), reverse=True)
+    return patterns
+
+
+def ensure_organization(name, parent_name=None, informatica_id=None, filename_tokens=None):
+    """Insert a base org into the catalog if missing. Returns the stored base name.
+
+    Does not modify tasks rows. Mass Ingestion suffixes are stripped for catalog storage.
+    """
+    from mappings import base_org_name
+
+    init_database()
+    base = base_org_name(name)
+    if not base or base == "Unknown":
+        return base
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        existing = conn.execute(
+            "SELECT name FROM organizations WHERE name = ?", (base,)
+        ).fetchone()
+        if existing:
+            return base
+
+        max_sort = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) FROM organizations"
+        ).fetchone()[0]
+        tokens = None
+        if filename_tokens:
+            if isinstance(filename_tokens, (list, tuple)):
+                tokens = ",".join(str(t).strip().lower() for t in filename_tokens if str(t).strip())
+            else:
+                tokens = str(filename_tokens).strip().lower() or None
+
+        conn.execute(
+            """
+            INSERT INTO organizations
+                (name, informatica_id, parent_name, filename_tokens, sort_order)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (base, informatica_id, parent_name, tokens, int(max_sort) + 10),
+        )
+        conn.commit()
+        return base
+    finally:
+        conn.close()
+
+
+def get_org_name(org_id):
+    """Map an Informatica Org ID to its catalog name (fallback: id as string)."""
+    org_id_str = str(org_id).strip() if org_id is not None else ""
+    if not org_id_str:
+        return "Unknown"
+
+    init_database()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            """
+            SELECT name FROM organizations
+            WHERE informatica_id = ?
+            LIMIT 1
+            """,
+            (org_id_str,),
+        ).fetchone()
+        if row:
+            return row[0]
+    finally:
+        conn.close()
+
+    from mappings import DEFAULT_ORG_ID_MAPPING
+    return DEFAULT_ORG_ID_MAPPING.get(org_id_str, org_id_str)
 
 
 def _migrate_mass_ingestion_orgs(cursor, conn):
